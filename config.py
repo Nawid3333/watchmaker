@@ -82,6 +82,18 @@ USER_AGENT = (
 DEFAULT_BATCH_FILE_PATH = "series_urls.txt"
 
 
+# ==================== EXPORT TO SCRAPER LISTS ====================
+# Map each site family to an external series_urls.txt file.
+# After a successful run, watchmaker will append any newly seen URLs
+# to these files. Set a value to None to disable exporting for that family.
+# Relative paths are resolved against PROJECT_ROOT.
+SERIES_URLS_EXPORTS: dict[str, str | None] = {
+    "aniworld": r"v:\Coding projects\Aniworld.to HTTPX scraper\series_urls.txt",
+    "bs": r"v:\Coding projects\BS.to HTTPX scraper\series_urls.txt",
+    "sto": r"v:\Coding projects\S.to HTTPX scraper\series_urls.txt",
+}
+
+
 # ==================== STATE FILES ====================
 FAILED_URLS_FILE = os.path.join(DATA_DIR, ".failed_urls.json")
 DEFAULT_BATCH_FILE = (
@@ -89,6 +101,19 @@ DEFAULT_BATCH_FILE = (
     if os.path.isabs(DEFAULT_BATCH_FILE_PATH)
     else os.path.join(PROJECT_ROOT, DEFAULT_BATCH_FILE_PATH)
 )
+
+
+def _resolve_export_path(path: str | None) -> str | None:
+    """Return an absolute path for an export file, or None if disabled."""
+    if not path:
+        return None
+    return path if os.path.isabs(path) else os.path.join(PROJECT_ROOT, path)
+
+
+SERIES_URLS_EXPORTS = {
+    family: _resolve_export_path(path)
+    for family, path in SERIES_URLS_EXPORTS.items()
+}
 
 
 def get_family(host: str) -> str | None:

@@ -1,8 +1,8 @@
 # watchmaker
 
-Batch mark whole series as watched or unwatched on the aniworld.to / bs.to family / s.to family streaming sites.
+Batch mark whole series as watched or unwatched on the aniworld.to, bs.to family, and s.to family streaming sites.
 
-One sequential worker logs into each exact host once, discovers every season of each series URL, and invokes the site's native "mark all episodes in this season" control.
+One sequential worker logs into each reachable host, discovers every season of each series URL, and invokes the site's native "mark all episodes in this season" control.
 
 ## Supported hosts
 
@@ -34,40 +34,53 @@ Run the interactive menu:
 python main.py
 ```
 
-At startup you can choose the source:
+The program starts with the default batch file (`series_urls.txt`) already loaded. If the file is empty, the menu is still shown so you can add a URL or switch batch files with option **6**.
 
-- **Paste a URL** → marks that single series
-- **Enter a file path** → uses that file as the batch
-- **Press Enter** → uses the default batch file
-- **Type 0** → exit
+Each host is pinged once; unreachable hosts are skipped, and reachable family mirrors are used automatically. Raw IP addresses such as `186.2.175.5` are contacted over HTTP, all other hosts over HTTPS.
 
 ### Menu options
 
 1. Mark as **WATCHED**
 2. Mark as **UNWATCHED**
-3. Exit
+3. Export URLs to scraper lists
+4. Rewrite URLs to reachable hosts
+5. Retry failed URLs
+6. Add / change batch
+7. Import URLs from scraper lists
+8. Exit
 
-At startup, each host found in the batch is pinged once. Hosts that do not respond are skipped, so the script will not try to log into dead mirrors. If a site family has several mirrors in the batch, only one reachable mirror is used.
+Before marking, a preview of every series, season, and current episode count is shown. Confirm with **y** to proceed or **n** to cancel.
 
-## Configuration
+### Changing the batch on the fly (option 6)
 
-### Default batch file path
+While the program is running, select **6** to:
 
-Open `config.py` and change `DEFAULT_BATCH_FILE_PATH`:
+- Paste a single URL → overwrites the default batch with that URL.
+- Enter a file path → switches the current batch to that file.
+
+### Importing URLs from scraper lists (option 7)
+
+Select **7** to pull URLs from the scraper `series_urls.txt` files defined in `config.py` (`SERIES_URLS_EXPORTS`) and append any new URLs to the current batch file. The import preview shows which URLs will be added per family and skips anything already present in the batch.
+
+### Manual batch override
+
+You can override the default batch for a single run:
+
+```bash
+set WATCHMAKER_URLS_FILE=path\to\urls.txt
+python main.py
+```
+
+Or change the default path permanently in `config.py`:
 
 ```python
 DEFAULT_BATCH_FILE_PATH = "series_urls.txt"          # relative to the project folder
 DEFAULT_BATCH_FILE_PATH = r"C:\Users\me\urls.txt"   # absolute path
 ```
 
-### Custom batch file per run
+## Configuration
 
-You can also override the default for a single run:
-
-```bash
-set WATCHMAKER_URLS_FILE=path\to\urls.txt
-python main.py
-```
+See `config.py` for credentials, supported domains, export/import targets, and the default batch file path.
 
 ## Outputs
 
