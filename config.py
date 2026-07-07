@@ -1,0 +1,110 @@
+"""
+Configuration for the watchmaker multi-domain batch watch-marker.
+Loads credentials from watchmaker/config/.env and defines supported domains.
+"""
+
+import os
+from pathlib import Path
+from urllib.parse import urlparse
+from dotenv import load_dotenv
+
+# Load environment variables from .env in the project root
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+
+
+# ==================== SUPPORTED DOMAINS ====================
+# Map each exact host to its site family and credential key.
+SUPPORTED_DOMAINS: dict[str, str] = {
+    "aniworld.to": "aniworld",
+    "bs.to": "bs",
+    "bs.cine.to": "bs",
+    "burningseries.ac": "bs",
+    "burningseries.cx": "bs",
+    "s.to": "sto",
+    "serienstream.to": "sto",
+    "186.2.175.5": "sto",
+}
+
+# Deterministic domain processing order
+DOMAIN_ORDER = [
+    "aniworld.to",
+    "bs.to",
+    "bs.cine.to",
+    "burningseries.ac",
+    "burningseries.cx",
+    "s.to",
+    "serienstream.to",
+    "186.2.175.5",
+]
+
+
+# ==================== CREDENTIALS ====================
+CREDENTIALS = {
+    "aniworld": {
+        "email": os.getenv("ANIWORLD_EMAIL", ""),
+        "password": os.getenv("ANIWORLD_PASSWORD", ""),
+    },
+    "bs": {
+        "username": os.getenv("BS_USERNAME", ""),
+        "password": os.getenv("BS_PASSWORD", ""),
+    },
+    "sto": {
+        "email": os.getenv("STO_EMAIL", ""),
+        "password": os.getenv("STO_PASSWORD", ""),
+    },
+}
+
+
+# ==================== DIRECTORIES ====================
+PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
+DATA_DIR = os.path.join(PROJECT_ROOT, "data")
+LOGS_DIR = os.path.join(PROJECT_ROOT, "logs")
+
+Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
+Path(LOGS_DIR).mkdir(parents=True, exist_ok=True)
+
+
+# ==================== LOGGING ====================
+LOG_FILE = os.path.join(LOGS_DIR, "watchmaker.log")
+
+
+# ==================== HTTP SETTINGS ====================
+HTTP_REQUEST_TIMEOUT = 20.0
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) "
+    "Gecko/20100101 Firefox/128.0"
+)
+
+
+# ==================== USER CONFIG ====================
+# Change this if you want the default batch file to live elsewhere.
+# It can be an absolute path or a path relative to the project root.
+DEFAULT_BATCH_FILE_PATH = "series_urls.txt"
+
+
+# ==================== STATE FILES ====================
+FAILED_URLS_FILE = os.path.join(DATA_DIR, ".failed_urls.json")
+DEFAULT_BATCH_FILE = (
+    DEFAULT_BATCH_FILE_PATH
+    if os.path.isabs(DEFAULT_BATCH_FILE_PATH)
+    else os.path.join(PROJECT_ROOT, DEFAULT_BATCH_FILE_PATH)
+)
+
+
+def get_family(host: str) -> str | None:
+    """Return the site family for a supported host, or None."""
+    return SUPPORTED_DOMAINS.get(host.lower())
+
+
+def credentials_for_family(family: str) -> dict:
+    """Return the credentials dict for a site family."""
+    return CREDENTIALS.get(family, {})
+
+
+def validate_all_credentials() -> dict[str, bool]:
+    """Check whether each configured family has non-empty credentials."""
+    result: dict[str, bool] = {}
+    for family, creds in CREDENTIALS.items():
+        has_any = any(creds.values())
+        result[family] = has_any
+    return result
