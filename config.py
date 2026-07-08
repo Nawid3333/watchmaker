@@ -8,8 +8,9 @@ from pathlib import Path
 from urllib.parse import urlparse
 from dotenv import load_dotenv
 
-# Load environment variables from .env in the project root
-load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+ROOT = Path(__file__).resolve().parent
+# Load environment variables from .env next to this config file (project root)
+load_dotenv(os.path.join(ROOT, ".env"))
 
 
 # ==================== SUPPORTED DOMAINS ====================
