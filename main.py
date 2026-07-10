@@ -593,13 +593,25 @@ class DomainWorker:
             })
             if r.status_code not in (200, 301, 302):
                 return False
-            text = await self._get(base)
-            nav = BeautifulSoup(text, "html.parser").select_one(
-                "section.navigation")
+            # Verify login by checking whether the login form is gone.
+            # Some BS mirrors (e.g. bs.cine.to) do not render the same
+            # section.navigation logout link that bs.to does.
+            text = await self._get(login_url)
+            soup = BeautifulSoup(text, "html.parser")
+            has_login_form = (
+                soup.find("form", action=lambda v: v and "login" in v)
+                or soup.find("input", {"name": "login[user]"})
+                or soup.find("input", {"name": "security_token"})
+            )
+            if not has_login_form:
+                return True
+            # Fallback: classic navigation logout link. Scan all links
+            # because on mirrors like bs.cine.to the first link is not logout.
+            nav = soup.select_one("section.navigation")
             if nav is not None:
-                logout_link = nav.find("a", href=True)
-                if logout_link and "logout" in (logout_link.get("href") or ""):
-                    return True
+                for link in nav.find_all("a", href=True):
+                    if "logout" in (link.get("href") or ""):
+                        return True
             return False
 
         # aniworld + s.to family
@@ -1145,6 +1157,7 @@ def _print_run_summary(stats: dict, results: list[SeriesResult]) -> None:
     print("=" * 56)
     for r in results:
         print(f"  {r.line()}")
+        print("    current status | after marking")
         for line in r.detail_lines():
             print(line)
     print("-" * 56)
@@ -1244,6 +1257,14 @@ def _status_emoji(status: str) -> str:
 
 def clear_screen() -> None:
     os.system("cls" if os.name == "nt" else "clear")
+
+
+def _pause_before_clear(prompt: str = "  press Enter to continue...") -> None:
+    """Wait for the user so they can read the previous output before clearing."""
+    try:
+        input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        pass
 
 
 def print_banner() -> None:
@@ -1422,6 +1443,7 @@ async def run_action(action: str, urls_file: str) -> None:
                             "ok": True,
                         })
                     print(f"  {host}: {result.title or slug}")
+                    print("      current status | preview")
                     for line in result.detail_lines():
                         print(f"      {line.strip()}")
                 except Exception as exc:
@@ -1761,9 +1783,11 @@ async def main() -> None:
             break
         elif choice == "1":
             await run_action("watched", urls_file)
+            _pause_before_clear("  press Enter to return to menu...")
             host_statuses = await startup_host_check(urls_file)
         elif choice == "2":
             await run_action("unwatched", urls_file)
+            _pause_before_clear("  press Enter to return to menu...")
             host_statuses = await startup_host_check(urls_file)
         elif choice == "3":
             await export_urls(urls_file)
