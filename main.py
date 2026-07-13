@@ -50,80 +50,6 @@ _MAX_RETRIES = 3
 _BASE_BACKOFF = 1.0
 
 
-class FileLock:
-    """Cross-platform PID-based lock file using a plain file."""
-
-    def __init__(self, lock_path: str, timeout: float = 30.0, stale_seconds: float = 300.0):
-        self.lock_path = lock_path
-        self.timeout = timeout
-        self.stale_seconds = stale_seconds
-        self._owned = False
-
-    def _read_lock_pid(self) -> int | None:
-        try:
-            with open(self.lock_path, "r", encoding="utf-8") as f:
-                pid_str = f.read(32).strip()
-            return int(pid_str) if pid_str else None
-        except (FileNotFoundError, ValueError, PermissionError):
-            return None
-
-    def _is_stale(self) -> bool:
-        try:
-            mtime = os.path.getmtime(self.lock_path)
-            return time.time() - mtime > self.stale_seconds
-        except FileNotFoundError:
-            return True
-
-    def _try_acquire(self) -> bool:
-        try:
-            fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(str(os.getpid()))
-            self._owned = True
-            return True
-        except FileExistsError:
-            return False
-
-    def _break_stale(self) -> bool:
-        if not self._is_stale():
-            return False
-        try:
-            os.remove(self.lock_path)
-            return self._try_acquire()
-        except (FileNotFoundError, PermissionError):
-            return self._try_acquire()
-
-    def acquire(self) -> bool:
-        deadline = time.time() + self.timeout
-        while time.time() < deadline:
-            if self._try_acquire():
-                return True
-            if self._break_stale():
-                return True
-            time.sleep(0.1)
-        return False
-
-    def release(self) -> None:
-        if not self._owned:
-            return
-        try:
-            pid = self._read_lock_pid()
-            if pid is None or pid == os.getpid():
-                os.remove(self.lock_path)
-        except (FileNotFoundError, PermissionError):
-            pass
-        finally:
-            self._owned = False
-
-    def __enter__(self) -> "FileLock":
-        if not self.acquire():
-            raise TimeoutError(f"Could not acquire lock: {self.lock_path}")
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        self.release()
-
-
 def _check_error_page(html: str, family: str) -> str | None:
     """Detect 404/502/etc. pages served with HTTP 200."""
     soup = BeautifulSoup(html, "html.parser")
@@ -287,10 +213,8 @@ async def filter_reachable(grouped: dict[str, list[str]]) -> tuple[dict[str, lis
     reachable: dict[str, list[str]] = {}
     statuses: dict[str, str] = {}
 
-    # First pass: only check hosts actually used in the batch, plus any
-    # not-in-input-but-supported host would only slow things down and can
-    # confuse users with unrelated unreachable warnings.
-    hosts_to_check = set(grouped)
+    # First pass: check every host we know about
+    hosts_to_check = set(grouped) | set(SUPPORTED_DOMAINS)
     for host in sorted(hosts_to_check):
         ok, msg = await check_host(host)
         statuses[host] = f"{'OK' if ok else 'FAIL'} ({msg})"
@@ -593,25 +517,13 @@ class DomainWorker:
             })
             if r.status_code not in (200, 301, 302):
                 return False
-            # Verify login by checking whether the login form is gone.
-            # Some BS mirrors (e.g. bs.cine.to) do not render the same
-            # section.navigation logout link that bs.to does.
-            text = await self._get(login_url)
-            soup = BeautifulSoup(text, "html.parser")
-            has_login_form = (
-                soup.find("form", action=lambda v: v and "login" in v)
-                or soup.find("input", {"name": "login[user]"})
-                or soup.find("input", {"name": "security_token"})
-            )
-            if not has_login_form:
-                return True
-            # Fallback: classic navigation logout link. Scan all links
-            # because on mirrors like bs.cine.to the first link is not logout.
-            nav = soup.select_one("section.navigation")
+            text = await self._get(base)
+            nav = BeautifulSoup(text, "html.parser").select_one(
+                "section.navigation")
             if nav is not None:
-                for link in nav.find_all("a", href=True):
-                    if "logout" in (link.get("href") or ""):
-                        return True
+                logout_link = nav.find("a", href=True)
+                if logout_link and "logout" in (logout_link.get("href") or ""):
+                    return True
             return False
 
         # aniworld + s.to family
@@ -961,12 +873,7 @@ class DomainWorker:
                     pass
             elif family == "bs":
                 endpoint = f"{base}/serie/{slug}/{season}/des/{'watch:all' if action == 'watched' else 'unwatch:all'}"
-                r = await self._get(endpoint)
-                if r.status_code != 200:
-                    raise RuntimeError(f"bs mark returned {r.status_code}")
-                err = _check_error_page(r.text, family)
-                if err:
-                    raise RuntimeError(f"bs mark returned error page {err}")
+                await self._get(endpoint)
             else:  # sto
                 token = self._extract_csrf_token(text)
                 ctrl = BeautifulSoup(
@@ -1137,7 +1044,6 @@ async def process_batch(urls_file: str, action: str) -> tuple[dict, list[SeriesR
                 else:
                     stats["failed"] += 1
                     stats["failed_urls"].append(url)
-                    _append_failed_url(url)
                 print(result.line())
 
     _persist_failed_urls(stats)
@@ -1157,7 +1063,6 @@ def _print_run_summary(stats: dict, results: list[SeriesResult]) -> None:
     print("=" * 56)
     for r in results:
         print(f"  {r.line()}")
-        print("    current status | after marking")
         for line in r.detail_lines():
             print(line)
     print("-" * 56)
@@ -1170,11 +1075,10 @@ def _print_run_summary(stats: dict, results: list[SeriesResult]) -> None:
 
 
 def _persist_failed_urls(stats: dict) -> None:
-    """Write the final consolidated failed-URL list (idempotent after per-URL appends)."""
-    failed = sorted(set(stats.get("failed_urls", [])))
     Path(FAILED_URLS_FILE).parent.mkdir(parents=True, exist_ok=True)
     with open(FAILED_URLS_FILE, "w", encoding="utf-8") as f:
-        json.dump(failed, f, indent=2, ensure_ascii=False)
+        json.dump(stats.get("failed_urls", []),
+                  f, indent=2, ensure_ascii=False)
     logger.info("Finished: %d successful, %d failed",
                 stats["successful"], stats["failed"])
 
@@ -1226,26 +1130,13 @@ def append_urls_to_scraper_lists(results: list[SeriesResult]) -> None:
             continue
 
         Path(export_path).parent.mkdir(parents=True, exist_ok=True)
-        # Serialize concurrent appends to the same scraper list across processes.
-        # This uses a PID-based lock file so it works on both Windows and POSIX.
-        lock_path = export_path + ".watchmaker.lock"
-        lock = FileLock(lock_path)
-        with lock:
-            # Re-read under the lock to avoid duplicates from racing writers.
-            live_existing = set(_read_lines(export_path))
-            live_existing.discard("")
-            live_new_urls = sorted(urls - live_existing)
-            if not live_new_urls:
-                logger.info("No new URLs to append for %s", family)
-                continue
-            with open(export_path, "a", encoding="utf-8") as f:
-                for url in live_new_urls:
-                    f.write(url + "\n")
-            logger.info(
-                "Appended %d URL(s) to %s scraper list: %s",
-                len(live_new_urls), family, export_path)
-            print(
-                f"  appended {len(live_new_urls)} new URL(s) → {export_path}")
+        with open(export_path, "a", encoding="utf-8") as f:
+            for url in new_urls:
+                f.write(url + "\n")
+        logger.info(
+            "Appended %d URL(s) to %s scraper list: %s",
+            len(new_urls), family, export_path)
+        print(f"  appended {len(new_urls)} new URL(s) → {export_path}")
 
 
 # ==================== UI ====================
@@ -1257,14 +1148,6 @@ def _status_emoji(status: str) -> str:
 
 def clear_screen() -> None:
     os.system("cls" if os.name == "nt" else "clear")
-
-
-def _pause_before_clear(prompt: str = "  press Enter to continue...") -> None:
-    """Wait for the user so they can read the previous output before clearing."""
-    try:
-        input(prompt)
-    except (EOFError, KeyboardInterrupt):
-        pass
 
 
 def print_banner() -> None:
@@ -1372,30 +1255,12 @@ def deduplicate_family_mirrors(
         if statuses.get(host, "").startswith("OK"):
             selected[host] = grouped[host]
             seen_families.add(family)
-    # For any family with no reachable host, still keep the first host so the
-    # user sees failure; if we already selected a reachable host, merge any
-    # remaining same-family URLs so duplicate mirror URLs are not lost.
+    # For any family with no reachable host, still keep first host so user sees failure
     for host, urls in grouped.items():
         family = SUPPORTED_DOMAINS.get(host)
-        if not family:
-            continue
-        if family not in seen_families:
+        if family and family not in seen_families:
             selected[host] = urls
             seen_families.add(family)
-        elif host in selected:
-            # already selected this host above
-            pass
-        else:
-            # Same family already represented by another host; merge URLs while
-            # preserving order and deduplicating within the selected host.
-            representative_host = next(
-                (h for h, f in ((h, SUPPORTED_DOMAINS.get(h)) for h in DOMAIN_ORDER)
-                 if f == family and h in selected), None
-            )
-            if representative_host:
-                selected[representative_host] = list(
-                    dict.fromkeys(selected[representative_host] + urls)
-                )
     return selected
 
 
@@ -1443,7 +1308,6 @@ async def run_action(action: str, urls_file: str) -> None:
                             "ok": True,
                         })
                     print(f"  {host}: {result.title or slug}")
-                    print("      current status | preview")
                     for line in result.detail_lines():
                         print(f"      {line.strip()}")
                 except Exception as exc:
@@ -1612,18 +1476,6 @@ def _load_failed_urls() -> list[str]:
     return []
 
 
-def _append_failed_url(url: str) -> None:
-    """Persist a failed URL immediately so crashes don't lose it."""
-    existing = set(_load_failed_urls())
-    if url in existing:
-        return
-    existing.add(url)
-    Path(FAILED_URLS_FILE).parent.mkdir(parents=True, exist_ok=True)
-    with open(FAILED_URLS_FILE, "w", encoding="utf-8") as f:
-        json.dump(sorted(existing), f, indent=2, ensure_ascii=False)
-    logger.warning("Recorded failed URL: %s", url)
-
-
 def _has_failed_urls() -> bool:
     return bool(_load_failed_urls())
 
@@ -1731,26 +1583,14 @@ async def _detect_and_add_input(urls_file: str) -> str:
 
     if user_input.startswith("http://") or user_input.startswith("https://"):
         Path(DEFAULT_BATCH_FILE).parent.mkdir(parents=True, exist_ok=True)
-        target = DEFAULT_BATCH_FILE
-        existing_lines = _read_lines(target)
-        existing_urls = set(line.strip() for line in existing_lines if line.strip(
-        ) and not line.strip().startswith("#"))
-
-        if target != urls_file and _batch_has_urls(target):
-            if not ask_yes_no(f"  add URL to existing {target}?", default=True):
+        if DEFAULT_BATCH_FILE != urls_file and _batch_has_urls(DEFAULT_BATCH_FILE):
+            if not ask_yes_no(f"  overwrite {DEFAULT_BATCH_FILE}?", default=False):
                 print("  cancelled.")
                 return urls_file
-
-        new_lines = [line for line in existing_lines if line.strip()]
-        if user_input not in existing_urls:
-            new_lines.append(user_input)
-
-        with open(target, "w", encoding="utf-8") as f:
-            for line in new_lines:
-                f.write(line + "\n")
-        print(
-            f"  wrote 1 new URL → {target} (kept {len(existing_urls)} existing)")
-        return target
+        with open(DEFAULT_BATCH_FILE, "w", encoding="utf-8") as f:
+            f.write(user_input + "\n")
+        print(f"  wrote 1 URL → {DEFAULT_BATCH_FILE}")
+        return DEFAULT_BATCH_FILE
 
     candidate = user_input
     if not os.path.exists(candidate):
@@ -1783,11 +1623,9 @@ async def main() -> None:
             break
         elif choice == "1":
             await run_action("watched", urls_file)
-            _pause_before_clear("  press Enter to return to menu...")
             host_statuses = await startup_host_check(urls_file)
         elif choice == "2":
             await run_action("unwatched", urls_file)
-            _pause_before_clear("  press Enter to return to menu...")
             host_statuses = await startup_host_check(urls_file)
         elif choice == "3":
             await export_urls(urls_file)

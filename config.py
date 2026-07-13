@@ -8,9 +8,11 @@ from pathlib import Path
 from urllib.parse import urlparse
 from dotenv import load_dotenv
 
-ROOT = Path(__file__).resolve().parent
+# Resolve the project root once — used for .env loading, data/logs dirs, and
+# resolving relative paths in DEFAULT_BATCH_FILE_PATH / SERIES_URLS_EXPORTS.
+PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
 # Load environment variables from .env next to this config file (project root)
-load_dotenv(os.path.join(ROOT, ".env"))
+load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 
 
 # ==================== SUPPORTED DOMAINS ====================
@@ -57,7 +59,6 @@ CREDENTIALS = {
 
 
 # ==================== DIRECTORIES ====================
-PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 LOGS_DIR = os.path.join(PROJECT_ROOT, "logs")
 

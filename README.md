@@ -34,12 +34,13 @@ Run the interactive menu:
 python main.py
 ```
 
-The program starts with the default batch file (`series_urls.txt`) already loaded. If the file is empty, the menu is still shown so you can add a URL or switch batch files with option **6**.
+The program starts with the default batch file (`series_urls.txt`) already loaded. If the file is empty, the menu is still shown so you can add a URL or switch batch files with option **7**.
 
 Each host is pinged once; unreachable hosts are skipped, and reachable family mirrors are used automatically. Raw IP addresses such as `186.2.175.5` are contacted over HTTP, all other hosts over HTTPS.
 
 ### Menu options
 
+0. Exit
 1. Mark as **WATCHED**
 2. Mark as **UNWATCHED**
 3. Export URLs to scraper lists
@@ -47,7 +48,6 @@ Each host is pinged once; unreachable hosts are skipped, and reachable family mi
 5. Retry failed URLs
 6. Add / change batch
 7. Import URLs from scraper lists
-8. Exit
 
 Before marking, a preview of every series, season, and current episode count is shown. Confirm with **y** to proceed or **n** to cancel.
 
@@ -64,18 +64,13 @@ Select **7** to pull URLs from the scraper `series_urls.txt` files defined in `c
 
 ### Manual batch override
 
-You can override the default batch for a single run:
-
-```bash
-set WATCHMAKER_URLS_FILE=path\to\urls.txt
-python main.py
-```
+You can override the default batch for a single run by editing `DEFAULT_BATCH_FILE` in `config.py`.
 
 Or change the default path permanently in `config.py`:
 
 ```python
-DEFAULT_BATCH_FILE_PATH = "series_urls.txt"          # relative to the project folder
-DEFAULT_BATCH_FILE_PATH = r"C:\Users\me\urls.txt"   # absolute path
+DEFAULT_BATCH_FILE = "series_urls.txt"          # relative to the project folder
+DEFAULT_BATCH_FILE = r"C:\Users\me\urls.txt"   # absolute path
 ```
 
 ## Configuration
@@ -84,6 +79,5 @@ See `config.py` for credentials, supported domains, export/import targets, and t
 
 ## Outputs
 
-- `data/last_run_report.json` — full report of the last run.
 - `data/.failed_urls.json` — list of URLs that failed so they can be retried.
 - `logs/watchmaker.log` — detailed debug log.
