@@ -270,6 +270,113 @@ async def filter_reachable(grouped: dict[str, list[str]]) -> tuple[dict[str, lis
     return reachable, statuses
 
 
+async def resolve_active_hosts(
+    urls_file: str,
+) -> tuple[dict[str, list[str]], dict[str, str], dict[str, str]]:
+    """Pick one reachable host per site family in the batch and rewrite URLs to it.
+
+    Only hosts belonging to families actually present in the batch are checked,
+    avoiding wasted pings for unused families. Once a family has an active mirror,
+    every URL in that family is rewritten to that host and the batch file is updated.
+
+    Returns ``(resolved, statuses, active_host_by_family)`` where
+    ``active_host_by_family`` maps each family in the batch to the host that will
+    actually be used, so the UI can highlight it.
+    """
+    grouped, rejected = load_url_batches(urls_file)
+    statuses: dict[str, str] = {}
+
+    # Only check hosts for families that appear in the batch.
+    families_in_batch: set[str] = {
+        SUPPORTED_DOMAINS[host]
+        for host in grouped
+        if host in SUPPORTED_DOMAINS
+    }
+    hosts_to_check = [
+        host
+        for host in DOMAIN_ORDER
+        if SUPPORTED_DOMAINS.get(host) in families_in_batch
+    ]
+
+    for host in hosts_to_check:
+        ok, msg = await check_host(host)
+        statuses[host] = f"{'OK' if ok else 'FAIL'} ({msg})"
+        if ok:
+            logger.info("Reachable %s (%s)", host, msg)
+        else:
+            logger.warning("Unreachable %s (%s)", host, msg)
+
+    # Pick the first reachable host per family in DOMAIN_ORDER.
+    active_host_by_family: dict[str, str] = {}
+    for host in DOMAIN_ORDER:
+        family = SUPPORTED_DOMAINS.get(host)
+        if not family or family in active_host_by_family:
+            continue
+        if statuses.get(host, "").startswith("OK"):
+            active_host_by_family[family] = host
+
+    # Rewrite URLs to the active host of their family.
+    resolved: dict[str, list[str]] = {}
+    rewritten: list[str] = []
+    for host, urls in grouped.items():
+        family = SUPPORTED_DOMAINS.get(host)
+        if not family:
+            resolved.setdefault(host, []).extend(urls)
+            continue
+        active_host = active_host_by_family.get(family)
+        if not active_host:
+            logger.warning(
+                "No reachable host for family %s — skipping %d URL(s)",
+                family, len(urls),
+            )
+            statuses[host] = f"FAIL (no reachable {family} mirror)"
+            continue
+        if host == active_host:
+            resolved.setdefault(host, []).extend(urls)
+        else:
+            migrated: list[str] = []
+            for url in urls:
+                new_url = _url_for_host(url, active_host)
+                if new_url:
+                    migrated.append(new_url)
+                    rewritten.append(f"{url} -> {new_url}")
+                    logger.info("Migrated %s -> %s", url, new_url)
+                else:
+                    logger.warning("Could not rewrite %s to %s",
+                                   url, active_host)
+            if migrated:
+                resolved.setdefault(active_host, []).extend(migrated)
+                statuses[host] = f"FAIL -> {active_host}"
+                logger.warning(
+                    "Migrated %d URL(s) from %s to %s",
+                    len(migrated), host, active_host,
+                )
+
+    # Deduplicate per host after migration.
+    for host in resolved:
+        resolved[host] = list(dict.fromkeys(resolved[host]))
+
+    # Persist any rewrites to the batch file permanently.
+    if rewritten:
+        all_urls: list[str] = []
+        seen: set[str] = set()
+        for urls in resolved.values():
+            for url in urls:
+                if url not in seen:
+                    seen.add(url)
+                    all_urls.append(url)
+        Path(urls_file).parent.mkdir(parents=True, exist_ok=True)
+        with open(urls_file, "w", encoding="utf-8") as f:
+            for url in all_urls:
+                f.write(url + "\n")
+        print(f"\n  → rewritten {len(rewritten)} URL(s) to active hosts:")
+        for line in rewritten:
+            print(f"    {line}")
+        logger.info("Rewrote %d URL(s) in %s", len(rewritten), urls_file)
+
+    return resolved, statuses, active_host_by_family
+
+
 # ==================== DOMAIN WORKER ====================
 class SeriesResult:
     def __init__(self, host: str, family: str, url: str, slug: str):
@@ -1001,8 +1108,12 @@ class DomainWorker:
 
 
 # ==================== BATCH PROCESSOR ====================
-async def process_batch(urls_file: str, action: str) -> tuple[dict, list[SeriesResult]]:
-    grouped, rejected = load_url_batches(urls_file)
+async def process_batch(
+    action: str,
+    grouped: dict[str, list[str]],
+    statuses: dict[str, str],
+    rejected: list[dict],
+) -> tuple[dict, list[SeriesResult]]:
     stats = {
         "total_urls": sum(len(urls) for urls in grouped.values()),
         "rejected": rejected,
@@ -1018,7 +1129,6 @@ async def process_batch(urls_file: str, action: str) -> tuple[dict, list[SeriesR
         return stats, results
 
     original = dict(grouped)
-    grouped, statuses = await filter_reachable(grouped)
     grouped = deduplicate_family_mirrors(grouped, statuses)
     stats["skipped_hosts"] = [
         {"host": host, "urls": len(
@@ -1160,7 +1270,13 @@ def print_banner() -> None:
     print("=" * 56)
 
 
-def print_menu(urls_file: str, statuses: dict[str, str], has_failed: bool) -> None:
+def print_menu(
+    urls_file: str,
+    statuses: dict[str, str],
+    has_failed: bool,
+    active_host_by_family: dict[str, str] | None = None,
+) -> None:
+    active_hosts = set((active_host_by_family or {}).values())
     print(f"\n  batch file: {urls_file}")
     if not _batch_has_urls(urls_file):
         print("  default batch file is empty.")
@@ -1174,7 +1290,8 @@ def print_menu(urls_file: str, statuses: dict[str, str], has_failed: bool) -> No
             emoji = _status_emoji(status)
             short = status[3:] if status.startswith(
                 "OK ") else status[5:] if status.startswith("FAIL ") else status
-            print(f"    {host:<{host_w}}  {emoji} {short}")
+            marker = "  ← ACTIVE" if host in active_hosts else ""
+            print(f"    {host:<{host_w}}  {emoji} {short}{marker}")
     else:
         print("    (no supported URLs)")
     if has_failed:
@@ -1183,10 +1300,9 @@ def print_menu(urls_file: str, statuses: dict[str, str], has_failed: bool) -> No
     print("    1  mark as WATCHED")
     print("    2  mark as UNWATCHED")
     print("    3  export URLs to scraper lists")
-    print("    4  rewrite URLs to reachable hosts")
-    print("    5  retry failed URLs")
-    print("    6  add / change batch")
-    print("    7  import URLs from scraper lists")
+    print("    4  retry failed URLs")
+    print("    5  add / change batch")
+    print("    6  import URLs from scraper lists")
     print("    0  exit")
 
 
@@ -1205,6 +1321,14 @@ def ask_yes_no(prompt: str, default: bool = False) -> bool:
 
 def print_batch_summary(urls_file: str, action: str = "") -> None:
     grouped, rejected = load_url_batches(urls_file)
+    print_batch_summary_from_grouped(grouped, action=action, rejected=rejected)
+
+
+def print_batch_summary_from_grouped(
+    grouped: dict[str, list[str]],
+    action: str = "",
+    rejected: list[dict] | None = None,
+) -> None:
     total = sum(len(urls) for urls in grouped.values())
     verb = action.lower() if action else "process"
     print(f"\n  → {total} series to {verb}")
@@ -1268,19 +1392,25 @@ def deduplicate_family_mirrors(
     return selected
 
 
-async def run_action(action: str, urls_file: str) -> None:
+async def run_action(
+    action: str,
+    urls_file: str,
+    grouped: dict[str, list[str]],
+    statuses: dict[str, str],
+) -> None:
     missing = validate_credentials_for_batch(urls_file)
     if missing:
         print("\n  ✗ missing credentials for:", ", ".join(missing))
         print("  please fill in watchmaker/.env")
         return
 
-    print_batch_summary(urls_file, action=action)
+    print_batch_summary_from_grouped(grouped, action=action)
 
-    grouped, _ = load_url_batches(urls_file)
     print("\n  → preview before marking:")
     print(f"  action: {action}")
     print()
+    preview_results: list[SeriesResult] = []
+    already_done_count = 0
     for host, urls in sorted(grouped.items()):
         async with DomainWorker(host) as worker:
             if not await worker.login():
@@ -1301,6 +1431,7 @@ async def run_action(action: str, urls_file: str) -> None:
                     except Exception as exc:  # noqa: BLE001
                         logger.warning(
                             "Preview title extraction failed for %s: %s", url, exc)
+                    all_already = True
                     for season in seasons:
                         season_url = worker._season_url_from_slug(url, season)
                         before_watched, total = worker._count_episodes(await worker._get(season_url))
@@ -1312,18 +1443,32 @@ async def run_action(action: str, urls_file: str) -> None:
                             "total": total,
                             "ok": True,
                         })
-                    print(f"  {host}: {result.title or slug}")
-                    for line in result.detail_lines():
-                        print(f"      {line.strip()}")
+                        if before_watched != planned_after:
+                            all_already = False
+                    if all_already:
+                        already_done_count += 1
+                        print(
+                            f"  {host}: {result.title or slug} — already {action}")
+                    else:
+                        preview_results.append(result)
+                        print(f"  {host}: {result.title or slug}")
+                        for line in result.detail_lines():
+                            print(f"      {line.strip()}")
                 except Exception as exc:
                     print(f"  ✗ preview failed for {url}: {exc}")
                     continue
+
+    if not preview_results:
+        print(
+            f"\n  → nothing to do; all {already_done_count} series already marked as {action}.")
+        return
 
     if not ask_yes_no("\n  proceed with marking?", default=False):
         print("  marking cancelled.")
         return
 
-    report, results = await process_batch(urls_file, action)
+    _, rejected = load_url_batches(urls_file)
+    report, results = await process_batch(action, grouped, statuses, rejected)
     _print_run_summary(report, results)
 
 
@@ -1511,68 +1656,6 @@ async def retry_failed_urls(urls_file: str) -> str:
     return urls_file
 
 
-async def rewrite_urls_to_reachable(urls_file: str) -> None:
-    """Rewrite URLs in the batch file to the first reachable host per family."""
-    grouped, rejected = load_url_batches(urls_file)
-    if not grouped:
-        print("\n  no supported URLs to rewrite.")
-        return
-
-    # Check every known host so we can pick a reachable representative
-    statuses: dict[str, str] = {}
-    for host in sorted(SUPPORTED_DOMAINS):
-        ok, msg = await check_host(host)
-        statuses[host] = f"{'OK' if ok else 'FAIL'} ({msg})"
-
-    family_representative: dict[str, str] = {}
-    for host in DOMAIN_ORDER:
-        family = SUPPORTED_DOMAINS.get(host)
-        if not family:
-            continue
-        if statuses.get(host, "").startswith("OK"):
-            family_representative.setdefault(family, host)
-
-    rewrites: list[tuple[str, str]] = []
-    unchanged: list[str] = []
-    for host, urls in grouped.items():
-        family = SUPPORTED_DOMAINS.get(host)
-        if not family:
-            unchanged.extend(urls)
-            continue
-        target_host = family_representative.get(family, host)
-        if target_host == host:
-            unchanged.extend(urls)
-            continue
-        for url in urls:
-            new_url = _url_for_host(url, target_host)
-            if new_url:
-                rewrites.append((url, new_url))
-            else:
-                unchanged.append(url)
-
-    if not rewrites:
-        print("\n  all URLs already point to reachable hosts.")
-        return
-
-    print(f"\n  → {len(rewrites)} URL(s) will be rewritten:")
-    for old, new in rewrites:
-        print(f"    {old} → {new}")
-    if unchanged:
-        print(f"\n  {len(unchanged)} URL(s) unchanged")
-
-    if not ask_yes_no("\n  save rewritten URLs to batch file?"):
-        print("  rewrite cancelled.")
-        return
-
-    all_urls = [new for _, new in rewrites] + unchanged
-    all_urls = list(dict.fromkeys(all_urls))
-    with open(urls_file, "w", encoding="utf-8") as f:
-        for url in all_urls:
-            f.write(url + "\n")
-    print(f"  saved {len(all_urls)} URL(s) → {urls_file}")
-    logger.info("Rewrote %d URL(s) in %s", len(rewrites), urls_file)
-
-
 async def _detect_and_add_input(urls_file: str) -> str:
     """Scraper-style input: detect URL, existing file path, or file name."""
     print("\n  add / change batch")
@@ -1614,39 +1697,37 @@ async def main() -> None:
     urls_file = DEFAULT_BATCH_FILE
     Path(urls_file).parent.mkdir(parents=True, exist_ok=True)
 
+    # Single sticky host resolution at startup.
+    resolved, host_statuses, active_host_by_family = await resolve_active_hosts(urls_file)
+
     while True:
-        clear_screen()
-
-        host_statuses = await startup_host_check(urls_file)
-
         print_banner()
-        print_menu(urls_file, host_statuses, _has_failed_urls())
+        print_menu(urls_file, host_statuses,
+                   _has_failed_urls(), active_host_by_family)
 
         choice = input("\n  enter number: ").strip()
         if choice == "0":
             print("  exiting.")
             break
         elif choice == "1":
-            await run_action("watched", urls_file)
-            host_statuses = await startup_host_check(urls_file)
+            await run_action("watched", urls_file, resolved, host_statuses)
         elif choice == "2":
-            await run_action("unwatched", urls_file)
-            host_statuses = await startup_host_check(urls_file)
+            await run_action("unwatched", urls_file, resolved, host_statuses)
         elif choice == "3":
             await export_urls(urls_file)
         elif choice == "4":
-            await rewrite_urls_to_reachable(urls_file)
-            host_statuses = await startup_host_check(urls_file)
-        elif choice == "5":
             urls_file = await retry_failed_urls(urls_file)
-            host_statuses = await startup_host_check(urls_file)
-        elif choice == "6":
+            print("\n  → refreshing host resolution ...")
+            resolved, host_statuses, active_host_by_family = await resolve_active_hosts(urls_file)
+        elif choice == "5":
             clear_screen()
             urls_file = await _detect_and_add_input(urls_file)
-            host_statuses = await startup_host_check(urls_file)
-        elif choice == "7":
+            print("\n  → refreshing host resolution ...")
+            resolved, host_statuses, active_host_by_family = await resolve_active_hosts(urls_file)
+        elif choice == "6":
             await import_urls(urls_file)
-            host_statuses = await startup_host_check(urls_file)
+            print("\n  → refreshing host resolution ...")
+            resolved, host_statuses, active_host_by_family = await resolve_active_hosts(urls_file)
         else:
             print("  invalid option.")
 
