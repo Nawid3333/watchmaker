@@ -517,13 +517,16 @@ class DomainWorker:
             })
             if r.status_code not in (200, 301, 302):
                 return False
-            text = await self._get(base)
+            # Verify on the series catalogue page, just like the BS scraper,
+            # because the homepage may not reliably render the logout link.
+            text = await self._get(f"{base}/andere-serien")
             nav = BeautifulSoup(text, "html.parser").select_one(
                 "section.navigation")
-            if nav is not None:
-                logout_link = nav.find("a", href=True)
-                if logout_link and "logout" in (logout_link.get("href") or ""):
-                    return True
+            if nav is not None and nav.find("a", href="logout") is not None:
+                return True
+            # Fallback: any exact logout href on the verification page.
+            if BeautifulSoup(text, "html.parser").find("a", href="logout") is not None:
+                return True
             return False
 
         # aniworld + s.to family
@@ -1147,7 +1150,8 @@ def _status_emoji(status: str) -> str:
 
 
 def clear_screen() -> None:
-    os.system("cls" if os.name == "nt" else "clear")
+    """Keep terminal output scrollable; clearing is disabled."""
+    pass
 
 
 def print_banner() -> None:
@@ -1187,7 +1191,7 @@ def print_menu(urls_file: str, statuses: dict[str, str], has_failed: bool) -> No
 
 
 def ask_yes_no(prompt: str, default: bool = False) -> bool:
-    suffix = " [Y/n]: " if default else " [y/N]: "
+    suffix = " [y/n]: " if default else " [y/n]: "
     while True:
         choice = input(prompt + suffix).strip().lower()
         if not choice:
@@ -1300,10 +1304,11 @@ async def run_action(action: str, urls_file: str) -> None:
                     for season in seasons:
                         season_url = worker._season_url_from_slug(url, season)
                         before_watched, total = worker._count_episodes(await worker._get(season_url))
+                        planned_after = total if action == "watched" else 0
                         result.seasons.append({
                             "season": season,
                             "watched_before": before_watched,
-                            "watched_after": before_watched,
+                            "watched_after": planned_after,
                             "total": total,
                             "ok": True,
                         })
