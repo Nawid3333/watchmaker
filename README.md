@@ -34,9 +34,9 @@ Run the interactive menu:
 python main.py
 ```
 
-The program starts with the default batch file (`series_urls.txt`) already loaded. If the file is empty, the menu is still shown so you can add a URL or switch batch files with option **7**.
+The program starts with the default batch file (`series_urls.txt`) already loaded. If the file is empty, the menu is still shown so you can add a URL or switch batch files with option **5**.
 
-Each host is pinged once; unreachable hosts are skipped, and reachable family mirrors are used automatically. Raw IP addresses such as `186.2.175.5` are contacted over HTTP, all other hosts over HTTPS.
+Each host is pinged once; unreachable hosts are skipped, and reachable family mirrors are used automatically. Raw IP addresses such as `186.2.175.5` are contacted over HTTP, all other hosts over HTTPS. Reachable hosts are resolved on startup and URLs in the batch file are rewritten to the first reachable mirror of each site family. The same refresh happens after retrying failed URLs, changing the batch, or importing URLs.
 
 ### Menu options
 
@@ -44,23 +44,22 @@ Each host is pinged once; unreachable hosts are skipped, and reachable family mi
 1. Mark as **WATCHED**
 2. Mark as **UNWATCHED**
 3. Export URLs to scraper lists
-4. Rewrite URLs to reachable hosts
-5. Retry failed URLs
-6. Add / change batch
-7. Import URLs from scraper lists
+4. Retry failed URLs
+5. Add / change batch
+6. Import URLs from scraper lists
 
 Before marking, a preview of every series, season, and current episode count is shown. Confirm with **y** to proceed or **n** to cancel.
 
-### Changing the batch on the fly (option 6)
+### Changing the batch on the fly (option 5)
 
-While the program is running, select **6** to:
+While the program is running, select **5** to:
 
 - Paste a single URL → overwrites the default batch with that URL.
 - Enter a file path → switches the current batch to that file.
 
-### Importing URLs from scraper lists (option 7)
+### Importing URLs from scraper lists (option 6)
 
-Select **7** to pull URLs from the scraper `series_urls.txt` files defined in `config.py` (`SERIES_URLS_EXPORTS`) and append any new URLs to the current batch file. The import preview shows which URLs will be added per family and skips anything already present in the batch.
+Select **6** to pull URLs from the scraper `series_urls.txt` files defined in `config.py` (`SERIES_URLS_EXPORTS`) and append any new URLs to the current batch file. The import preview shows which URLs will be added per family and skips anything already present in the batch.
 
 ### Manual batch override
 
