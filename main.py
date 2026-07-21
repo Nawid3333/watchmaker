@@ -407,24 +407,30 @@ class SeriesResult:
         self.title = title
 
     def line(self) -> str:
-        sub = "✓" if self.subscribed else "✗" if self.subscribed is False else "?"
-        wl = "✓" if self.watchlist else "✗" if self.watchlist is False else "?"
         status = "✓" if self.ok and self.watched_episodes == self.total_episodes else "✗"
         display = f"{self.title} ({self.slug})" if self.title else self.slug
+        extra = ""
+        if self.family != "bs":
+            sub = "✓" if self.subscribed else "✗" if self.subscribed is False else "?"
+            wl = "✓" if self.watchlist else "✗" if self.watchlist is False else "?"
+            extra = f" (Sub:{sub} WL:{wl})"
         return (
             f"{status} {display} [{','.join(self.season_labels)}]: "
-            f"{self.watched_episodes}/{self.total_episodes} watched "
-            f"(Sub:{sub} WL:{wl})"
+            f"{self.watched_episodes}/{self.total_episodes} watched"
+            f"{extra}"
         )
 
-    def detail_lines(self) -> list[str]:
+    def detail_lines(self, action: str = "") -> list[str]:
         lines = []
         for s in self.seasons:
             label = s.get("season", "?")
             before = s.get("watched_before", 0)
             after = s.get("watched_after", before)
             total = s.get("total", 0)
-            lines.append(f"    S{label}: {before}/{total} -> {after}/{total}")
+            planned_after = total if action == "watched" else 0 if action == "unwatched" else after
+            marker = "▶" if action and before != planned_after else "|" if action else " "
+            lines.append(
+                f"    {marker}S{label}: {before}/{total} -> {after}/{total}")
         return lines
 
 
@@ -927,6 +933,7 @@ class DomainWorker:
 
         text = await self._get(season_url)
         before_watched, total = self._count_episodes(text)
+        planned_after = total if action == "watched" else 0
         result = {
             "season": season,
             "watched_before": before_watched,
@@ -935,8 +942,17 @@ class DomainWorker:
             "ok": True,
         }
 
+        # Skip issuing a mark request when the season already matches the target state.
+        # We still verify by re-fetching the season page afterwards.
+        skip_mark = before_watched == planned_after and total > 0
+
         try:
-            if family == "aniworld":
+            if skip_mark:
+                logger.info(
+                    "Skipping mark for %s season %s (already %s)",
+                    url, season, action,
+                )
+            elif family == "aniworld":
                 soup = BeautifulSoup(text, "html.parser")
                 # The season page we just fetched is already scoped to the requested
                 # season. Prefer the clear-all control, which carries the correct
@@ -1022,6 +1038,13 @@ class DomainWorker:
             text = await self._get(season_url)
             after_watched, _ = self._count_episodes(text)
             result["watched_after"] = after_watched
+            if skip_mark and after_watched != planned_after:
+                result["ok"] = False
+                logger.error(
+                    "Season %s of %s expected to be already %s but "
+                    "verification shows %d/%d watched",
+                    season, url, action, after_watched, result["total"],
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "Could not re-check season %s after mark: %s", season, exc)
@@ -1163,7 +1186,7 @@ async def process_batch(
     return stats, results
 
 
-def _print_run_summary(stats: dict, results: list[SeriesResult]) -> None:
+def _print_run_summary(stats: dict, results: list[SeriesResult], action: str = "") -> None:
     total = stats["total_urls"]
     ok_count = stats["successful"]
     fail = stats["failed"]
@@ -1176,7 +1199,7 @@ def _print_run_summary(stats: dict, results: list[SeriesResult]) -> None:
     print("=" * 56)
     for r in results:
         print(f"  {r.line()}")
-        for line in r.detail_lines():
+        for line in r.detail_lines(action):
             print(line)
     print("-" * 56)
     print(f"  series total: {total} | ok: {ok_count} | failed: {fail}")
@@ -1280,7 +1303,7 @@ def print_menu(
     print(f"\n  batch file: {urls_file}")
     if not _batch_has_urls(urls_file):
         print("  default batch file is empty.")
-        print("  use option 6 to add a URL or switch batch file.")
+        print("  use option 5 to add a URL or switch batch file.")
     print("\n  hosts:")
     if statuses:
         host_w = max(len(h) for h in statuses)
@@ -1301,7 +1324,7 @@ def print_menu(
     print("    2  mark as UNWATCHED")
     print("    3  export URLs to scraper lists")
     print("    4  retry failed URLs")
-    print("    5  add / change batch")
+    print("    5  add link / change batch")
     print("    6  import URLs from scraper lists")
     print("    0  exit")
 
@@ -1328,13 +1351,24 @@ def print_batch_summary_from_grouped(
     grouped: dict[str, list[str]],
     action: str = "",
     rejected: list[dict] | None = None,
+    header: str = "",
+    max_urls_per_host: int = 10,
 ) -> None:
     total = sum(len(urls) for urls in grouped.values())
     verb = action.lower() if action else "process"
+    if header:
+        print(f"\n  {header}")
     print(f"\n  → {total} series to {verb}")
     if grouped:
         for host, urls in sorted(grouped.items()):
-            print(f"      • {host}: {len(urls)}")
+            family = SUPPORTED_DOMAINS.get(host, "?")
+            print(f"      • {host} ({family}): {len(urls)}")
+            shown = urls[:max_urls_per_host]
+            remaining = len(urls) - max_urls_per_host
+            for url in shown:
+                print(f"          {url}")
+            if remaining > 0:
+                print(f"          ... and {remaining} more")
     if rejected:
         print(f"    ⚠ skipped {len(rejected)} unsupported URL(s)")
 
@@ -1428,9 +1462,17 @@ async def run_action(
                     try:
                         series_text = await worker._get(url)
                         result.set_title(series_text)
+                        if worker.family in ("aniworld", "sto"):
+                            result.subscribed, result.watchlist = worker._detect_subscription_status(
+                                series_text)
                     except Exception as exc:  # noqa: BLE001
                         logger.warning(
                             "Preview title extraction failed for %s: %s", url, exc)
+                    needs_sub_change = (
+                        action == "watched"
+                        and worker.family in ("aniworld", "sto")
+                        and result.subscribed is False
+                    )
                     all_already = True
                     for season in seasons:
                         season_url = worker._season_url_from_slug(url, season)
@@ -1445,14 +1487,21 @@ async def run_action(
                         })
                         if before_watched != planned_after:
                             all_already = False
-                    if all_already:
+                    status_extra = ""
+                    if worker.family in ("aniworld", "sto"):
+                        sub = "✓" if result.subscribed else "✗" if result.subscribed is False else "?"
+                        wl = "✓" if result.watchlist else "✗" if result.watchlist is False else "?"
+                        status_extra = f" (Sub:{sub} WL:{wl})"
+                    sub_badge = " ⚡" if needs_sub_change else ""
+                    if all_already and not needs_sub_change:
                         already_done_count += 1
                         print(
-                            f"  {host}: {result.title or slug} — already {action}")
+                            f"  {host}: {result.title or slug}{status_extra}{sub_badge} — already {action}")
                     else:
                         preview_results.append(result)
-                        print(f"  {host}: {result.title or slug}")
-                        for line in result.detail_lines():
+                        print(
+                            f"  {host}: {result.title or slug}{status_extra}{sub_badge}")
+                        for line in result.detail_lines(action):
                             print(f"      {line.strip()}")
                 except Exception as exc:
                     print(f"  ✗ preview failed for {url}: {exc}")
@@ -1469,7 +1518,7 @@ async def run_action(
 
     _, rejected = load_url_batches(urls_file)
     report, results = await process_batch(action, grouped, statuses, rejected)
-    _print_run_summary(report, results)
+    _print_run_summary(report, results, action=action)
 
 
 async def import_urls(urls_file: str) -> None:
@@ -1658,7 +1707,7 @@ async def retry_failed_urls(urls_file: str) -> str:
 
 async def _detect_and_add_input(urls_file: str) -> str:
     """Scraper-style input: detect URL, existing file path, or file name."""
-    print("\n  add / change batch")
+    print("\n  add link / change batch")
     print(f"  current file: {urls_file}")
     print("  • Paste URL      → writes single URL to default batch")
     print("  • Enter path     → switches to that batch file")
@@ -1696,6 +1745,15 @@ async def main() -> None:
 
     urls_file = DEFAULT_BATCH_FILE
     Path(urls_file).parent.mkdir(parents=True, exist_ok=True)
+
+    # Show batch overview before resolving hosts.
+    initial_grouped, initial_rejected = load_url_batches(urls_file)
+    print_banner()
+    print_batch_summary_from_grouped(
+        initial_grouped,
+        header="loaded batch",
+        rejected=initial_rejected,
+    )
 
     # Single sticky host resolution at startup.
     resolved, host_statuses, active_host_by_family = await resolve_active_hosts(urls_file)
