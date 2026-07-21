@@ -19,6 +19,8 @@ load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 # Map each exact host to its site family and credential key.
 SUPPORTED_DOMAINS: dict[str, str] = {
     "aniworld.to": "aniworld",
+    "aniworld.cc": "aniworld",
+    "186.2.175.111": "aniworld",
     "bs.to": "bs",
     "bs.cine.to": "bs",
     "burningseries.ac": "bs",
@@ -31,6 +33,8 @@ SUPPORTED_DOMAINS: dict[str, str] = {
 # Deterministic domain processing order
 DOMAIN_ORDER = [
     "aniworld.to",
+    "aniworld.cc",
+    "186.2.175.111",
     "bs.to",
     "bs.cine.to",
     "burningseries.ac",

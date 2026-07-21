@@ -6,7 +6,7 @@ One sequential worker logs into each reachable host, discovers every season of e
 
 ## Supported hosts
 
-- `aniworld.to`
+- `aniworld.to`, `aniworld.cc`, `186.2.175.111`
 - `bs.to`, `bs.cine.to`, `burningseries.ac`, `burningseries.cx`
 - `s.to`, `serienstream.to`, `186.2.175.5`
 
