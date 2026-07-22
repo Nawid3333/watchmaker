@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -428,10 +429,14 @@ class SeriesResult:
             after = s.get("watched_after", before)
             total = s.get("total", 0)
             planned_after = total if action == "watched" else 0 if action == "unwatched" else after
-            marker = "▶" if action and before != planned_after else "|" if action else " "
-            lines.append(
-                f"    {marker}S{label}: {before}/{total} -> {after}/{total}")
+            if not action or before == planned_after:
+                continue
+            lines.append(f"    ▶S{label}: {before}/{total} -> {after}/{total}")
         return lines
+
+    def season_summary(self) -> str:
+        labels = [str(s.get("season", "?")) for s in self.seasons]
+        return f"[{','.join(labels)}]"
 
 
 class DomainWorker:
@@ -1195,19 +1200,47 @@ def _print_run_summary(stats: dict, results: list[SeriesResult], action: str = "
     watched_eps = sum(r.watched_episodes for r in results)
 
     print("\n" + "=" * 56)
-    print("  run summary")
+    print("  RUN SUMMARY")
     print("=" * 56)
-    for r in results:
-        print(f"  {r.line()}")
-        for line in r.detail_lines(action):
-            print(line)
-    print("-" * 56)
-    print(f"  series total: {total} | ok: {ok_count} | failed: {fail}")
-    print(f"  episodes: {watched_eps}/{total_eps} watched")
+
+    if results:
+        term_w = max(shutil.get_terminal_size().columns - 12, 40)
+        host_w = min(max(len(r.host) for r in results), term_w // 3)
+        series_w = min(max(len(r.name) for r in results), term_w // 3)
+        result_w = min(max(len(r.line()) for r in results), term_w // 3)
+
+        def _trunc(text, width):
+            return text if len(text) <= width else text[:width - 1] + '…'
+
+        result_w = max(result_w, len("Result"))
+        table_w = host_w + series_w + result_w + 6
+        sep = '─' * table_w
+
+        print(
+            f"    {'Host':<{host_w}}  {'Series':<{series_w}}  {'Result':<{result_w}}")
+        print(f"    {'─' * host_w}  {'─' * series_w}  {'─' * result_w}")
+        for r in results:
+            row = f"    {_trunc(r.host, host_w):<{host_w}}  {_trunc(r.name, series_w):<{series_w}}  {_trunc(r.line(), result_w):<{result_w}}"
+            print(row.rstrip())
+        print(sep)
+
+    summary_metrics = [
+        ("Series processed", str(total)),
+        ("Successful", str(ok_count)),
+        ("Failed", str(fail)),
+        ("Episodes watched", f"{watched_eps}/{total_eps}"),
+    ]
     if skipped:
-        print(f"  skipped hosts: {len(skipped)}")
+        summary_metrics.append(("Skipped hosts", str(len(skipped))))
     if fail:
-        print(f"  failed list: {FAILED_URLS_FILE}")
+        summary_metrics.append(("Failed list", FAILED_URLS_FILE))
+
+    label_w = max(len(m[0]) for m in summary_metrics)
+    value_w = max(len(m[1]) for m in summary_metrics)
+    for label, value in summary_metrics:
+        line = f"    {label:<{label_w}}  {value:<{value_w}}"
+        print(line.rstrip())
+    print("=" * 56)
 
 
 def _persist_failed_urls(stats: dict) -> None:
@@ -1306,15 +1339,34 @@ def print_menu(
         print("  use option 5 to add a URL or switch batch file.")
     print("\n  hosts:")
     if statuses:
-        host_w = max(len(h) for h in statuses)
-        print(f"    {'Host':<{host_w}}  Status")
-        print(f"    {'-' * host_w}  ------")
+        term_w = max(shutil.get_terminal_size().columns - 12, 40)
+        host_w = min(max(len(h) for h in statuses), term_w // 2)
+        max_status = term_w - host_w - 10
+
+        def _trunc(text, width):
+            return text if len(text) <= width else text[:width - 1] + '…'
+
+        state_w = max(len("State"), 1)
+        details_w = min(max_status, max(
+            len(_trunc(s[3:] if s.startswith("OK ") else s[5:]
+                if s.startswith("FAIL ") else s, max_status)) + 2
+            for s in statuses.values()
+        ))
+        details_w = max(details_w, len("Details"))
+        table_w = host_w + state_w + details_w + 6
+        sep = '─' * table_w
+
+        print(f"    {'Host':<{host_w}}  State{' ' * (state_w - 4)}  Details")
+        print(f"    {'─' * host_w}  {'─' * state_w}  {'─' * details_w}")
         for host, status in sorted(statuses.items()):
             emoji = _status_emoji(status)
             short = status[3:] if status.startswith(
                 "OK ") else status[5:] if status.startswith("FAIL ") else status
             marker = "  ← ACTIVE" if host in active_hosts else ""
-            print(f"    {host:<{host_w}}  {emoji} {short}{marker}")
+            details = _trunc(f"{short}{marker}", max_status)
+            row = f"    {_trunc(host, host_w):<{host_w}}  {emoji:<{state_w}}  {details:<{details_w}}"
+            print(row.rstrip())
+        print(sep)
     else:
         print("    (no supported URLs)")
     if has_failed:
@@ -1493,14 +1545,24 @@ async def run_action(
                         wl = "✓" if result.watchlist else "✗" if result.watchlist is False else "?"
                         status_extra = f" (Sub:{sub} WL:{wl})"
                     sub_badge = " ⚡" if needs_sub_change else ""
+                    before_eps = sum(
+                        s.get("watched_before", 0) for s in result.seasons)
+                    planned_eps = sum(
+                        s.get("watched_after", s.get("watched_before", 0))
+                        for s in result.seasons
+                    )
+                    seasons_tag = result.season_summary()
+                    counter = f"{before_eps}/{result.total_episodes}"
+                    if before_eps != planned_eps:
+                        counter += f" → {planned_eps}/{result.total_episodes}"
                     if all_already and not needs_sub_change:
                         already_done_count += 1
                         print(
-                            f"  {host}: {result.title or slug}{status_extra}{sub_badge} — already {action}")
+                            f"  {host}: {result.title or slug}{status_extra}{sub_badge} {seasons_tag} — {counter}")
                     else:
                         preview_results.append(result)
                         print(
-                            f"  {host}: {result.title or slug}{status_extra}{sub_badge}")
+                            f"  {host}: {result.title or slug}{status_extra}{sub_badge} {seasons_tag} — {counter}")
                         for line in result.detail_lines(action):
                             print(f"      {line.strip()}")
                 except Exception as exc:
@@ -1509,7 +1571,7 @@ async def run_action(
 
     if not preview_results:
         print(
-            f"\n  → nothing to do; all {already_done_count} series already marked as {action}.")
+            f"\n  → nothing to do; all {already_done_count} series already at target state ({action}).")
         return
 
     if not ask_yes_no("\n  proceed with marking?", default=False):

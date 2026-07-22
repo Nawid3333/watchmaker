@@ -4,6 +4,8 @@ Batch mark whole series as watched or unwatched on the aniworld.to, bs.to family
 
 One sequential worker logs into each reachable host, discovers every season of each series URL, and invokes the site's native "mark all episodes in this season" control.
 
+When marking a series as **WATCHED** on the aniworld or s.to family, watchmaker also subscribes to the series first (if the subscribe control is present and not already active). The bs.to family has no subscribe control, so this step is skipped there.
+
 ## Supported hosts
 
 - `aniworld.to`, `aniworld.cc`, `186.2.175.111`
@@ -48,7 +50,7 @@ Each host is pinged once; unreachable hosts are skipped, and reachable family mi
 5. Add / change batch
 6. Import URLs from scraper lists
 
-Before marking, a preview of every series, season, and current episode count is shown. Confirm with **y** to proceed or **n** to cancel.
+Before marking, a preview of every series, season, and current episode count is shown. For the aniworld and s.to families the preview also shows the current subscription (`Sub`) and watchlist (`WL`) status per series, plus a `⚡` badge when a subscription change is pending. Confirm with **y** to proceed or **n** to cancel.
 
 ### Changing the batch on the fly (option 5)
 
@@ -75,6 +77,17 @@ DEFAULT_BATCH_FILE = r"C:\Users\me\urls.txt"   # absolute path
 ## Configuration
 
 See `config.py` for credentials, supported domains, export/import targets, and the default batch file path.
+
+Credentials are loaded from a `.env` file next to `config.py` (see `.env.example`):
+
+```
+ANIWORLD_EMAIL=...
+ANIWORLD_PASSWORD=...
+BS_USERNAME=...
+BS_PASSWORD=...
+STO_EMAIL=...
+STO_PASSWORD=...
+```
 
 ## Outputs
 
