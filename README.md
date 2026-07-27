@@ -70,8 +70,8 @@ You can override the default batch for a single run by editing `DEFAULT_BATCH_FI
 Or change the default path permanently in `config.py`:
 
 ```python
-DEFAULT_BATCH_FILE = "series_urls.txt"          # relative to the project folder
-DEFAULT_BATCH_FILE = r"C:\Users\me\urls.txt"   # absolute path
+DEFAULT_BATCH_FILE = "series_urls.txt"  # relative to the project folder
+DEFAULT_BATCH_FILE = r"C:\Users\me\urls.txt"  # absolute path
 ```
 
 ## Configuration

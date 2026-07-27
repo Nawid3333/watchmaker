@@ -5,7 +5,7 @@ Loads credentials from watchmaker/config/.env and defines supported domains.
 
 import os
 from pathlib import Path
-from urllib.parse import urlparse
+
 from dotenv import load_dotenv
 
 # Resolve the project root once — used for .env loading, data/logs dirs, and
@@ -17,30 +17,30 @@ load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 
 # ==================== SUPPORTED DOMAINS ====================
 # Map each exact host to its site family and credential key.
+# Dead primaries (bs.to, s.to) are intentionally omitted; the next reachable
+# mirror in DOMAIN_ORDER will be used automatically.
 SUPPORTED_DOMAINS: dict[str, str] = {
     "aniworld.to": "aniworld",
     "aniworld.cc": "aniworld",
     "186.2.175.111": "aniworld",
-    "bs.to": "bs",
     "bs.cine.to": "bs",
     "burningseries.ac": "bs",
     "burningseries.cx": "bs",
-    "s.to": "sto",
     "serienstream.to": "sto",
+    "serienstream.cx": "sto",
     "186.2.175.5": "sto",
 }
 
-# Deterministic domain processing order
+# Deterministic domain processing order (first reachable host wins per family)
 DOMAIN_ORDER = [
     "aniworld.to",
     "aniworld.cc",
     "186.2.175.111",
-    "bs.to",
     "bs.cine.to",
     "burningseries.ac",
     "burningseries.cx",
-    "s.to",
     "serienstream.to",
+    "serienstream.cx",
     "186.2.175.5",
 ]
 
@@ -76,10 +76,7 @@ LOG_FILE = os.path.join(LOGS_DIR, "watchmaker.log")
 
 # ==================== HTTP SETTINGS ====================
 HTTP_REQUEST_TIMEOUT = 20.0
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) "
-    "Gecko/20100101 Firefox/128.0"
-)
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
 
 
 # ==================== USER CONFIG ====================
@@ -116,10 +113,7 @@ def _resolve_export_path(path: str | None) -> str | None:
     return path if os.path.isabs(path) else os.path.join(PROJECT_ROOT, path)
 
 
-SERIES_URLS_EXPORTS = {
-    family: _resolve_export_path(path)
-    for family, path in SERIES_URLS_EXPORTS.items()
-}
+SERIES_URLS_EXPORTS = {family: _resolve_export_path(path) for family, path in SERIES_URLS_EXPORTS.items()}
 
 
 def get_family(host: str) -> str | None:

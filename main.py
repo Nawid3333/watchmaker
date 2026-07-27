@@ -1,4 +1,4 @@
-﻿"""
+"""
 watchmaker
 
 Batch mark whole series as watched or unwatched on aniworld.to, bs.to family,
@@ -6,13 +6,13 @@ and s.to family streaming sites.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import re
 import shutil
 import sys
-import time
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -51,20 +51,31 @@ _MAX_RETRIES = 3
 _BASE_BACKOFF = 1.0
 
 
+def _attr_str(value: object) -> str | None:
+    """Return a BeautifulSoup attribute value if it is a plain string."""
+    return value if isinstance(value, str) else None
+
+
+def _attr_int(value: object) -> int | None:
+    """Return an int parsed from a BeautifulSoup attribute value."""
+    if isinstance(value, (str, int)):
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
 def _check_error_page(html: str, family: str) -> str | None:
     """Detect 404/502/etc. pages served with HTTP 200."""
     soup = BeautifulSoup(html, "html.parser")
 
     # If the page still has real season navigation, it is not an error page.
     if family == "aniworld":
-        if soup.select_one("#stream ul li a[href*='/staffel-']") or soup.select_one(
-            "#stream ul li a[href*='/filme']"
-        ):
+        if soup.select_one("#stream ul li a[href*='/staffel-']") or soup.select_one("#stream ul li a[href*='/filme']"):
             return None
     elif family == "sto":
-        if soup.select_one("#season-nav a[data-season-pill]") or soup.select_one(
-            '#season-nav a[href*="/staffel-"]'
-        ):
+        if soup.select_one("#season-nav a[data-season-pill]") or soup.select_one('#season-nav a[href*="/staffel-"]'):
             return None
     else:  # bs
         if soup.select_one("#seasons a"):
@@ -125,10 +136,7 @@ def classify_url(url: str) -> tuple[str, str, str] | None:
         return None
 
     path = parsed.path or "/"
-    if family == "aniworld":
-        m = _ANIME_SLUG_RE.match(path)
-    else:
-        m = _SERIE_SLUG_RE.match(path)
+    m = _ANIME_SLUG_RE.match(path) if family == "aniworld" else _SERIE_SLUG_RE.match(path)
     return (host, family, m.group(1)) if m else None
 
 
@@ -136,7 +144,7 @@ def load_url_batches(source: str) -> tuple[dict[str, list[str]], list[dict]]:
     grouped: dict[str, list[str]] = {host: [] for host in SUPPORTED_DOMAINS}
     rejected: list[dict] = []
 
-    with open(source, "r", encoding="utf-8") as f:
+    with open(source, encoding="utf-8") as f:
         for raw in f:
             line = raw.strip()
             if not line or line.startswith("#"):
@@ -148,7 +156,9 @@ def load_url_batches(source: str) -> tuple[dict[str, list[str]], list[dict]]:
             classification = classify_url(line)
             if classification is None:
                 host = _normalize_host(urlparse(line).netloc)
-                reason = f"unsupported host: {host}" if host and host not in SUPPORTED_DOMAINS else "could not extract slug"
+                reason = (
+                    f"unsupported host: {host}" if host and host not in SUPPORTED_DOMAINS else "could not extract slug"
+                )
                 rejected.append({"line": line, "reason": reason})
                 continue
 
@@ -156,8 +166,7 @@ def load_url_batches(source: str) -> tuple[dict[str, list[str]], list[dict]]:
             if slug:
                 grouped[host].append(line)
             else:
-                rejected.append(
-                    {"line": line, "reason": "could not extract slug"})
+                rejected.append({"line": line, "reason": "could not extract slug"})
 
     ordered: dict[str, list[str]] = {}
     for host in DOMAIN_ORDER:
@@ -210,7 +219,9 @@ def _url_for_host(url: str, new_host: str) -> str | None:
     return parsed._replace(scheme=scheme, netloc=new_netloc).geturl()
 
 
-async def filter_reachable(grouped: dict[str, list[str]]) -> tuple[dict[str, list[str]], dict[str, str]]:
+async def filter_reachable(
+    grouped: dict[str, list[str]],
+) -> tuple[dict[str, list[str]], dict[str, str]]:
     reachable: dict[str, list[str]] = {}
     statuses: dict[str, str] = {}
 
@@ -225,7 +236,6 @@ async def filter_reachable(grouped: dict[str, list[str]]) -> tuple[dict[str, lis
             logger.warning("Unreachable %s (%s)", host, msg)
 
     # Second pass: map each input host to a reachable mirror in the same family
-    fallback_map: dict[str, str] = {}
     family_representative: dict[str, str] = {}
     for host in DOMAIN_ORDER:
         family = SUPPORTED_DOMAINS.get(host)
@@ -254,15 +264,11 @@ async def filter_reachable(grouped: dict[str, list[str]]) -> tuple[dict[str, lis
             if migrated:
                 reachable.setdefault(alt_host, []).extend(migrated)
                 statuses[host] = f"FAIL → {alt_host}"
-                logger.warning(
-                    "Migrated %d URL(s) from %s to %s",
-                    len(migrated), host, alt_host)
+                logger.warning("Migrated %d URL(s) from %s to %s", len(migrated), host, alt_host)
             else:
-                logger.warning("Unreachable %s — skipping %d URL(s)",
-                               host, len(grouped[host]))
+                logger.warning("Unreachable %s — skipping %d URL(s)", host, len(grouped[host]))
         else:
-            logger.warning("Unreachable %s — skipping %d URL(s)",
-                           host, len(grouped[host]))
+            logger.warning("Unreachable %s — skipping %d URL(s)", host, len(grouped[host]))
 
     # Deduplicate per host after migration
     for host in reachable:
@@ -288,16 +294,8 @@ async def resolve_active_hosts(
     statuses: dict[str, str] = {}
 
     # Only check hosts for families that appear in the batch.
-    families_in_batch: set[str] = {
-        SUPPORTED_DOMAINS[host]
-        for host in grouped
-        if host in SUPPORTED_DOMAINS
-    }
-    hosts_to_check = [
-        host
-        for host in DOMAIN_ORDER
-        if SUPPORTED_DOMAINS.get(host) in families_in_batch
-    ]
+    families_in_batch: set[str] = {SUPPORTED_DOMAINS[host] for host in grouped if host in SUPPORTED_DOMAINS}
+    hosts_to_check = [host for host in DOMAIN_ORDER if SUPPORTED_DOMAINS.get(host) in families_in_batch]
 
     for host in hosts_to_check:
         ok, msg = await check_host(host)
@@ -328,7 +326,8 @@ async def resolve_active_hosts(
         if not active_host:
             logger.warning(
                 "No reachable host for family %s — skipping %d URL(s)",
-                family, len(urls),
+                family,
+                len(urls),
             )
             statuses[host] = f"FAIL (no reachable {family} mirror)"
             continue
@@ -343,14 +342,15 @@ async def resolve_active_hosts(
                     rewritten.append(f"{url} -> {new_url}")
                     logger.info("Migrated %s -> %s", url, new_url)
                 else:
-                    logger.warning("Could not rewrite %s to %s",
-                                   url, active_host)
+                    logger.warning("Could not rewrite %s to %s", url, active_host)
             if migrated:
                 resolved.setdefault(active_host, []).extend(migrated)
                 statuses[host] = f"FAIL -> {active_host}"
                 logger.warning(
                     "Migrated %d URL(s) from %s to %s",
-                    len(migrated), host, active_host,
+                    len(migrated),
+                    host,
+                    active_host,
                 )
 
     # Deduplicate per host after migration.
@@ -442,9 +442,10 @@ class SeriesResult:
 class DomainWorker:
     def __init__(self, host: str):
         self.host = host
-        self.family = SUPPORTED_DOMAINS.get(host)
-        if not self.family:
+        family = SUPPORTED_DOMAINS.get(host)
+        if not family:
             raise ValueError(f"Unsupported host: {host}")
+        self.family: str = family
         self.creds = CREDENTIALS.get(self.family, {})
         self.client: httpx.AsyncClient | None = None
         self.logged_in = False
@@ -458,10 +459,12 @@ class DomainWorker:
         return self
 
     async def __aexit__(self, *args):
-        if self.client:
+        if self.client is not None:
             await self.client.aclose()
 
     async def _get(self, url: str) -> str:
+        if self.client is None:
+            raise RuntimeError("DomainWorker client not initialized")
         last_err: Exception | None = None
         for attempt in range(1, _MAX_RETRIES + 1):
             try:
@@ -470,31 +473,53 @@ class DomainWorker:
                 last_err = exc
                 if attempt < _MAX_RETRIES:
                     wait = _BASE_BACKOFF * (2 ** (attempt - 1))
-                    logger.warning("GET %s %s, retrying in %.1fs (attempt %d/%d)",
-                                   url, exc.__class__.__name__, wait, attempt, _MAX_RETRIES)
+                    logger.warning(
+                        "GET %s %s, retrying in %.1fs (attempt %d/%d)",
+                        url,
+                        exc.__class__.__name__,
+                        wait,
+                        attempt,
+                        _MAX_RETRIES,
+                    )
                     await asyncio.sleep(wait)
                 continue
 
             if r.status_code in (429, 500, 502, 503, 504):
                 if attempt < _MAX_RETRIES:
                     wait = _BASE_BACKOFF * (2 ** (attempt - 1))
-                    logger.warning("GET %s returned %s, retrying in %.1fs (attempt %d/%d)",
-                                   url, r.status_code, wait, attempt, _MAX_RETRIES)
+                    logger.warning(
+                        "GET %s returned %s, retrying in %.1fs (attempt %d/%d)",
+                        url,
+                        r.status_code,
+                        wait,
+                        attempt,
+                        _MAX_RETRIES,
+                    )
                     await asyncio.sleep(wait)
                     continue
-                last_err = httpx.HTTPStatusError(
-                    f"GET {url} returned {r.status_code}", request=r.request, response=r
-                )
+                last_err = httpx.HTTPStatusError(f"GET {url} returned {r.status_code}", request=r.request, response=r)
                 continue
 
             try:
                 r.raise_for_status()
             except httpx.HTTPStatusError as exc:
                 last_err = exc
-                if attempt < _MAX_RETRIES and exc.response.status_code in (429, 500, 502, 503, 504):
+                if attempt < _MAX_RETRIES and exc.response.status_code in (
+                    429,
+                    500,
+                    502,
+                    503,
+                    504,
+                ):
                     wait = _BASE_BACKOFF * (2 ** (attempt - 1))
-                    logger.warning("GET %s HTTP error %s, retrying in %.1fs (attempt %d/%d)",
-                                   url, exc.response.status_code, wait, attempt, _MAX_RETRIES)
+                    logger.warning(
+                        "GET %s HTTP error %s, retrying in %.1fs (attempt %d/%d)",
+                        url,
+                        exc.response.status_code,
+                        wait,
+                        attempt,
+                        _MAX_RETRIES,
+                    )
                     await asyncio.sleep(wait)
                     continue
                 raise
@@ -504,10 +529,18 @@ class DomainWorker:
                 raise RuntimeError(f"error page {err} for {url}")
             return r.text
 
-        raise last_err or RuntimeError(
-            f"GET {url} failed after {_MAX_RETRIES} attempts")
+        raise last_err or RuntimeError(f"GET {url} failed after {_MAX_RETRIES} attempts")
 
-    async def _post(self, url: str, data: dict | None = None, *, json: dict | None = None, headers: dict | None = None) -> httpx.Response:
+    async def _post(
+        self,
+        url: str,
+        data: dict | None = None,
+        *,
+        json: dict | None = None,
+        headers: dict | None = None,
+    ) -> httpx.Response:
+        if self.client is None:
+            raise RuntimeError("DomainWorker client not initialized")
         merged = dict(headers) if headers else {}
         last_err: Exception | None = None
         for attempt in range(1, _MAX_RETRIES + 1):
@@ -517,20 +550,34 @@ class DomainWorker:
                 last_err = exc
                 if attempt < _MAX_RETRIES:
                     wait = _BASE_BACKOFF * (2 ** (attempt - 1))
-                    logger.warning("POST %s %s, retrying in %.1fs (attempt %d/%d)",
-                                   url, exc.__class__.__name__, wait, attempt, _MAX_RETRIES)
+                    logger.warning(
+                        "POST %s %s, retrying in %.1fs (attempt %d/%d)",
+                        url,
+                        exc.__class__.__name__,
+                        wait,
+                        attempt,
+                        _MAX_RETRIES,
+                    )
                     await asyncio.sleep(wait)
                 continue
 
             if r.status_code in (429, 500, 502, 503, 504):
                 if attempt < _MAX_RETRIES:
                     wait = _BASE_BACKOFF * (2 ** (attempt - 1))
-                    logger.warning("POST %s returned %s, retrying in %.1fs (attempt %d/%d)",
-                                   url, r.status_code, wait, attempt, _MAX_RETRIES)
+                    logger.warning(
+                        "POST %s returned %s, retrying in %.1fs (attempt %d/%d)",
+                        url,
+                        r.status_code,
+                        wait,
+                        attempt,
+                        _MAX_RETRIES,
+                    )
                     await asyncio.sleep(wait)
                     continue
                 last_err = httpx.HTTPStatusError(
-                    f"POST {url} returned {r.status_code}", request=r.request, response=r
+                    f"POST {url} returned {r.status_code}",
+                    request=r.request,
+                    response=r,
                 )
                 continue
 
@@ -538,18 +585,29 @@ class DomainWorker:
                 r.raise_for_status()
             except httpx.HTTPStatusError as exc:
                 last_err = exc
-                if attempt < _MAX_RETRIES and exc.response.status_code in (429, 500, 502, 503, 504):
+                if attempt < _MAX_RETRIES and exc.response.status_code in (
+                    429,
+                    500,
+                    502,
+                    503,
+                    504,
+                ):
                     wait = _BASE_BACKOFF * (2 ** (attempt - 1))
-                    logger.warning("POST %s HTTP error %s, retrying in %.1fs (attempt %d/%d)",
-                                   url, exc.response.status_code, wait, attempt, _MAX_RETRIES)
+                    logger.warning(
+                        "POST %s HTTP error %s, retrying in %.1fs (attempt %d/%d)",
+                        url,
+                        exc.response.status_code,
+                        wait,
+                        attempt,
+                        _MAX_RETRIES,
+                    )
                     await asyncio.sleep(wait)
                     continue
                 raise
 
             return r
 
-        raise last_err or RuntimeError(
-            f"POST {url} failed after {_MAX_RETRIES} attempts")
+        raise last_err or RuntimeError(f"POST {url} failed after {_MAX_RETRIES} attempts")
 
     def _csrf_headers(self, token: str, json: bool = True) -> dict[str, str]:
         h = {
@@ -594,10 +652,10 @@ class DomainWorker:
         soup = BeautifulSoup(text, "html.parser")
         meta = soup.find("meta", attrs={"name": "csrf-token"})
         if meta:
-            return meta.get("content") or None
+            return _attr_str(meta.get("content"))
         # fallback: look for _token in a logout/account form
         for inp in soup.find_all("input", attrs={"name": "_token", "value": True}):
-            return inp.get("value") or None
+            return _attr_str(inp.get("value"))
         return None
 
     async def login(self) -> bool:
@@ -624,35 +682,37 @@ class DomainWorker:
 
         if family == "bs":
             token_input = soup.find("input", {"name": "security_token"})
-            token = token_input.get("value", "") if token_input else ""
+            token = _attr_str(token_input.get("value")) if token_input else ""
             if not token:
-                logger.warning(
-                    "CSRF security_token not found on login page for %s", self.host)
-            r = await self._post(login_url, data={
-                "login[user]": self.creds.get("username", ""),
-                "login[pass]": self.creds.get("password", ""),
-                "security_token": token,
-            })
+                logger.warning("CSRF security_token not found on login page for %s", self.host)
+            r = await self._post(
+                login_url,
+                data={
+                    "login[user]": self.creds.get("username", ""),
+                    "login[pass]": self.creds.get("password", ""),
+                    "security_token": token,
+                },
+            )
             if r.status_code not in (200, 301, 302):
                 return False
             # Verify on the series catalogue page, just like the BS scraper,
             # because the homepage may not reliably render the logout link.
             text = await self._get(f"{base}/andere-serien")
-            nav = BeautifulSoup(text, "html.parser").select_one(
-                "section.navigation")
+            nav = BeautifulSoup(text, "html.parser").select_one("section.navigation")
             if nav is not None and nav.find("a", href="logout") is not None:
                 return True
             # Fallback: any exact logout href on the verification page.
-            if BeautifulSoup(text, "html.parser").find("a", href="logout") is not None:
-                return True
-            return False
+            return BeautifulSoup(text, "html.parser").find("a", href="logout") is not None
 
         # aniworld + s.to family
         form = soup.find("form")
         payload: dict[str, str] = {}
         if form:
             for inp in form.find_all("input", attrs={"name": True}):
-                payload[inp.get("name", "")] = inp.get("value", "")
+                name = _attr_str(inp.get("name"))
+                if name:
+                    value = _attr_str(inp.get("value")) or ""
+                    payload[name] = value
         payload["email"] = self.creds.get("email", "")
         payload["password"] = self.creds.get("password", "")
 
@@ -663,14 +723,12 @@ class DomainWorker:
             for name in ("_token", "security_token"):
                 inp = soup.find("input", {"name": name, "value": True})
                 if inp:
-                    token = inp.get("value", "")
+                    token = _attr_str(inp.get("value")) or ""
                     break
         if token:
-            logger.info("Login CSRF token for %s: %s...",
-                        self.host, token[:16])
+            logger.info("Login CSRF token for %s: %s...", self.host, token[:16])
         else:
-            logger.warning(
-                "CSRF token not found on login page for %s", self.host)
+            logger.warning("CSRF token not found on login page for %s", self.host)
 
         r = await self._post(login_url, data=payload)
         if r.status_code not in (200, 301, 302):
@@ -691,7 +749,7 @@ class DomainWorker:
 
             # Primary selector: the first season list in #stream (matches the Aniworld scraper).
             for a in soup.select("#stream ul:first-of-type li a"):
-                href = a.get("href", "")
+                href = _attr_str(a.get("href")) or ""
                 if not href:
                     continue
                 m = _STAFFEL_RE.search(href)
@@ -703,24 +761,23 @@ class DomainWorker:
             # Fallback: scan all links when the primary selector is not available.
             if not seasons:
                 for a in soup.find_all("a", href=True):
-                    href = a["href"]
-                    if "/anime/stream/" in href:
-                        if "/staffel-" in href:
-                            try:
-                                seasons.add(
-                                    int(href.rsplit("/staffel-", 1)[1].split("/", 1)[0]))
-                            except (ValueError, IndexError):
-                                continue
-                        elif href.rstrip('/').endswith('/filme'):
-                            has_movies = True
+                    href = _attr_str(a.get("href"))
+                    if not href or "/anime/stream/" not in href:
+                        continue
+                    if "/staffel-" in href:
+                        try:
+                            seasons.add(int(href.rsplit("/staffel-", 1)[1].split("/", 1)[0]))
+                        except (ValueError, IndexError):
+                            continue
+                    elif href.rstrip("/").endswith("/filme"):
+                        has_movies = True
 
             # Last resort: numeric data-season-id attributes.
             if not seasons:
-                for el in soup.find_all(attrs={"data-season-id": True}):
-                    try:
-                        seasons.add(int(el["data-season-id"]))
-                    except (ValueError, TypeError):
-                        pass
+                for el in soup.find_all("[data-season-id]"):
+                    season_id = _attr_int(el.get("data-season-id"))
+                    if season_id is not None:
+                        seasons.add(season_id)
             result: list[int | str] = sorted(seasons)
             if has_movies:
                 result.append("Filme")
@@ -728,40 +785,38 @@ class DomainWorker:
         elif self.family == "bs":
             # Primary: use the dedicated season navigation container.
             for a in soup.select("#seasons a"):
-                href = a.get("href", "").split("?")[0].split("#")[0]
+                href_raw = _attr_str(a.get("href")) or ""
+                href = href_raw.split("?")[0].split("#")[0]
                 parts = href.strip("/").split("/")
                 if len(parts) >= 3 and parts[0] == "serie":
-                    try:
+                    with contextlib.suppress(ValueError, IndexError):
                         seasons.add(int(parts[2]))
-                    except (ValueError, IndexError):
-                        pass
             # Fallback: season <option> values.
             for opt in soup.find_all("option", value=True):
-                if opt["value"].isdigit():
-                    seasons.add(int(opt["value"]))
+                opt_value = _attr_str(opt.get("value"))
+                if opt_value and opt_value.isdigit():
+                    seasons.add(int(opt_value))
         else:  # sto
             classification = classify_url(url)
-            slug = classification[2] if classification else (
-                url.split("/serie/", 1)[1].split("/", 1)[0]
-            )
-            staffel_re = re.compile(
-                rf'/serie/{re.escape(slug)}/staffel-(\d+)')
+            slug = classification[2] if classification else (url.split("/serie/", 1)[1].split("/", 1)[0])
+            staffel_re = re.compile(rf"/serie/{re.escape(slug)}/staffel-(\d+)")
             # Primary: use the dedicated season nav pills.
             for link in soup.select("#season-nav a[data-season-pill]"):
-                season_num = link.get("data-season-pill", "")
-                if season_num and str(season_num).isdigit():
+                season_num = _attr_str(link.get("data-season-pill"))
+                if season_num and season_num.isdigit():
                     seasons.add(int(season_num))
             # Fallback: href pattern scoped to this series slug.
             for a in soup.find_all("a", href=True):
-                m = staffel_re.search(a["href"])
-                if m:
-                    seasons.add(int(m.group(1)))
+                href = _attr_str(a.get("href"))
+                if href:
+                    m = staffel_re.search(href)
+                    if m:
+                        seasons.add(int(m.group(1)))
             # Last resort: numeric data-season-id on the page.
-            for el in soup.find_all(attrs={"data-season-id": True}):
-                try:
-                    seasons.add(int(el["data-season-id"]))
-                except (ValueError, TypeError):
-                    pass
+            for el in soup.find_all("[data-season-id]"):
+                season_id = _attr_int(el.get("data-season-id"))
+                if season_id is not None:
+                    seasons.add(season_id)
 
         return sorted(seasons) if seasons else [1]
 
@@ -771,14 +826,12 @@ class DomainWorker:
         family = self.family
         rows: list = []
         if family == "aniworld":
-            rows = soup.select(
-                "table.seasonEpisodesList tbody tr[data-episode-id]")
+            rows = soup.select("table.seasonEpisodesList tbody tr[data-episode-id]")
             if not rows:
                 # Fallback: all episode rows in the first table on the page.
                 table = soup.select_one("table.seasonEpisodesList")
                 if table:
-                    rows = [r for r in table.select(
-                        "tbody tr") if r.get("data-episode-id")]
+                    rows = [r for r in table.select("tbody tr") if r.get("data-episode-id")]
             if not rows:
                 # Last resort: any table with data-episode-id rows.
                 rows = soup.select("tr[data-episode-id]")
@@ -821,21 +874,17 @@ class DomainWorker:
         if self.family == "aniworld":
             container = soup.select_one("div.add-series")
             if container:
-                subscribed = container.get("data-series-favourite") == "1"
-                watchlist = container.get("data-series-watchlist") == "1"
+                subscribed = _attr_str(container.get("data-series-favourite")) == "1"
+                watchlist = _attr_str(container.get("data-series-watchlist")) == "1"
             if subscribed is None:
-                subscribed = soup.select_one(
-                    "li.setFavourite.buttonAction.true") is not None
+                subscribed = soup.select_one("li.setFavourite.buttonAction.true") is not None
             if watchlist is None:
-                watchlist = soup.select_one(
-                    "li.setWatchlist.buttonAction.true") is not None
+                watchlist = soup.select_one("li.setWatchlist.buttonAction.true") is not None
         else:  # sto
-            buttons = soup.select(
-                ".d-none.d-md-flex .js-action-btn") or soup.select(".js-action-btn")
+            buttons = soup.select(".d-none.d-md-flex .js-action-btn") or soup.select(".js-action-btn")
             for button in buttons:
-                data_type = button.get("data-type")
-                active = "btn-glass-primary" in (
-                    button.get("class") or []) or button.get("data-active") == "1"
+                data_type = _attr_str(button.get("data-type"))
+                active = "btn-glass-primary" in (button.get("class") or []) or button.get("data-active") == "1"
                 if data_type == "favorite":
                     subscribed = active
                 elif data_type == "watchlater":
@@ -852,8 +901,7 @@ class DomainWorker:
         try:
             text = await self._get(url)
         except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Could not load series page for subscribe check: %s", exc)
+            logger.warning("Could not load series page for subscribe check: %s", exc)
             return False
 
         soup = BeautifulSoup(text, "html.parser")
@@ -862,17 +910,16 @@ class DomainWorker:
             container = soup.select_one("div.add-series")
             subscribed = False
             if container:
-                fav_val = container.get("data-series-favourite")
+                fav_val = _attr_str(container.get("data-series-favourite"))
                 if fav_val is not None:
                     subscribed = fav_val == "1"
                 else:
-                    subscribed = soup.select_one(
-                        "li.setFavourite.buttonAction.true") is not None
+                    subscribed = soup.select_one("li.setFavourite.buttonAction.true") is not None
             if subscribed:
                 logger.info("Already subscribed: %s", url)
                 return True
 
-            series_id = container.get("data-series-id") if container else None
+            series_id = _attr_str(container.get("data-series-id")) if container else None
             if not series_id:
                 logger.warning("No series-id found for subscribe on %s", url)
                 return False
@@ -884,19 +931,18 @@ class DomainWorker:
             try:
                 return bool(r.json().get("status"))
             except json.JSONDecodeError:
-                return '"status":true' in r.text or '"status" :true' in r.text or "status\":true" in r.text
+                return '"status":true' in r.text or '"status" :true' in r.text or 'status":true' in r.text
 
-        elif family == "sto":
+        else:  # sto
             token = self._extract_csrf_token(text)
-            buttons = soup.select(
-                ".d-none.d-md-flex .js-action-btn") or soup.select(".js-action-btn")
+            buttons = soup.select(".d-none.d-md-flex .js-action-btn") or soup.select(".js-action-btn")
             sub_url: str | None = None
             for button in buttons:
                 if button.get("data-type") == "favorite":
                     if "btn-glass-primary" in (button.get("class") or []) or button.get("data-active") == "1":
                         logger.info("Already subscribed: %s", url)
                         return True
-                    sub_url = button.get("data-url")
+                    sub_url = _attr_str(button.get("data-url"))
                     break
             if not sub_url:
                 logger.warning("No favorite toggle URL found for %s", url)
@@ -910,8 +956,12 @@ class DomainWorker:
             )
             ok = r.status_code == 200
             if not ok:
-                logger.warning("Subscribe failed for %s: %s body=%r",
-                               url, r.status_code, r.text[:200])
+                logger.warning(
+                    "Subscribe failed for %s: %s body=%r",
+                    url,
+                    r.status_code,
+                    r.text[:200],
+                )
             return ok
 
         return True
@@ -921,9 +971,10 @@ class DomainWorker:
         family = self.family
         base = f"{_scheme_for_host(self.host)}://{self.host}"
         classification = classify_url(url)
-        slug = classification[2] if classification else (
-            url.split("/anime/stream/" if family ==
-                      "aniworld" else "/serie/", 1)[1].split("/", 1)[0]
+        slug = (
+            classification[2]
+            if classification
+            else (url.split("/anime/stream/" if family == "aniworld" else "/serie/", 1)[1].split("/", 1)[0])
         )
         if isinstance(season, str) and season.lower() == "filme":
             season_url = f"{base}/anime/stream/{slug}/filme"
@@ -931,9 +982,7 @@ class DomainWorker:
             season_url = (
                 f"{base}/anime/stream/{slug}/staffel-{season}"
                 if family == "aniworld"
-                else f"{base}/serie/{slug}/staffel-{season}"
-                if family == "sto"
-                else f"{base}/serie/{slug}/{season}"
+                else (f"{base}/serie/{slug}/staffel-{season}" if family == "sto" else f"{base}/serie/{slug}/{season}")
             )
 
         text = await self._get(season_url)
@@ -955,7 +1004,9 @@ class DomainWorker:
             if skip_mark:
                 logger.info(
                     "Skipping mark for %s season %s (already %s)",
-                    url, season, action,
+                    url,
+                    season,
+                    action,
                 )
             elif family == "aniworld":
                 soup = BeautifulSoup(text, "html.parser")
@@ -963,28 +1014,26 @@ class DomainWorker:
                 # season. Prefer the clear-all control, which carries the correct
                 # data-season-id for this exact season.
                 season_id = None
-                clear_all = soup.find(
-                    "span", class_="clearAllEpisodesFromThisSeason")
+                clear_all = soup.find("span", class_="clearAllEpisodesFromThisSeason")
                 if clear_all and clear_all.has_attr("data-season-id"):
-                    season_id = clear_all["data-season-id"]
+                    season_id = _attr_str(clear_all["data-season-id"])
                 else:
                     # Fallback: find any element on this season page whose
                     # data-season-id matches the requested season number.
-                    for el in soup.find_all(attrs={"data-season-id": True}):
+                    for el in soup.find_all("[data-season-id]"):
                         try:
-                            if int(el["data-season-id"]) == int(season):
-                                season_id = el["data-season-id"]
+                            el_season_id = _attr_int(el.get("data-season-id"))
+                            if el_season_id is not None and el_season_id == int(season):
+                                season_id = str(el_season_id)
                                 break
                         except (ValueError, TypeError):
                             continue
                 if not season_id:
-                    raise RuntimeError(
-                        f"No season-id found for {slug} s{season}")
+                    raise RuntimeError(f"No season-id found for {slug} s{season}")
 
                 series_id = self._extract_series_id(soup)
                 if not series_id:
-                    raise RuntimeError(
-                        f"No series-id found for {slug} s{season}")
+                    raise RuntimeError(f"No series-id found for {slug} s{season}")
 
                 endpoint = f"{base}/ajax/watchseason"
                 payload = {
@@ -1007,35 +1056,34 @@ class DomainWorker:
                 await self._get(endpoint)
             else:  # sto
                 token = self._extract_csrf_token(text)
-                ctrl = BeautifulSoup(
-                    text, "html.parser").select_one("#season-mark")
+                ctrl = BeautifulSoup(text, "html.parser").select_one("#season-mark")
                 if not ctrl or not ctrl.has_attr("data-mark-url"):
-                    raise RuntimeError(
-                        f"No #season-mark control for {slug} s{season}")
+                    raise RuntimeError(f"No #season-mark control for {slug} s{season}")
                 if not token:
                     raise RuntimeError(f"No CSRF token for {slug} s{season}")
-                mark_url = urljoin(season_url, ctrl["data-mark-url"])
+                mark_url = urljoin(season_url, _attr_str(ctrl.get("data-mark-url")) or "")
                 r = await self._post(
                     mark_url,
-                    json={"action": "seen" if action ==
-                          "watched" else "unseen"},
+                    json={"action": "seen" if action == "watched" else "unseen"},
                     headers=self._csrf_headers(token),
                 )
-                logger.info("s.to mark POST %s -> %s body=%r",
-                            mark_url, r.status_code, r.text[:200])
+                logger.info(
+                    "s.to mark POST %s -> %s body=%r",
+                    mark_url,
+                    r.status_code,
+                    r.text[:200],
+                )
                 if r.status_code not in (200, 301, 302):
                     raise RuntimeError(f"mark returned {r.status_code}")
                 if r.text.strip():
                     try:
                         mark_data = json.loads(r.text)
                         if mark_data.get("ok") is not True:
-                            raise RuntimeError(
-                                f"s.to mark returned ok={mark_data.get('ok')}")
+                            raise RuntimeError(f"s.to mark returned ok={mark_data.get('ok')}")
                     except json.JSONDecodeError:
                         pass
         except Exception as exc:  # noqa: BLE001
-            logger.exception(
-                "Failed marking %s season %s: %s", url, season, exc)
+            logger.exception("Failed marking %s season %s: %s", url, season, exc)
             result["ok"] = False
             return result
 
@@ -1046,28 +1094,29 @@ class DomainWorker:
             if skip_mark and after_watched != planned_after:
                 result["ok"] = False
                 logger.error(
-                    "Season %s of %s expected to be already %s but "
-                    "verification shows %d/%d watched",
-                    season, url, action, after_watched, result["total"],
+                    "Season %s of %s expected to be already %s but verification shows %d/%d watched",
+                    season,
+                    url,
+                    action,
+                    after_watched,
+                    result["total"],
                 )
         except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Could not re-check season %s after mark: %s", season, exc)
+            logger.warning("Could not re-check season %s after mark: %s", season, exc)
         return result
 
     @staticmethod
     def _extract_series_id(soup: BeautifulSoup) -> str | None:
         container = soup.select_one("div.add-series")
         if container:
-            return container.get("data-series-id") or None
+            return _attr_str(container.get("data-series-id"))
         return None
 
     def _season_url_from_slug(self, url: str, season: int | str) -> str:
         """Build a season page URL from a series URL and season identifier."""
         family = self.family
         base = f"{_scheme_for_host(self.host)}://{self.host}"
-        slug = url.split("/anime/stream/" if family ==
-                         "aniworld" else "/serie/", 1)[1].split("/", 1)[0]
+        slug = url.split("/anime/stream/" if family == "aniworld" else "/serie/", 1)[1].split("/", 1)[0]
         if isinstance(season, str) and season.lower() == "filme":
             return f"{base}/anime/stream/{slug}/filme"
         if family == "aniworld":
@@ -1079,19 +1128,22 @@ class DomainWorker:
     async def mark_series(self, url: str, action: str) -> SeriesResult:
         if not self.logged_in and not await self.login():
             classification = classify_url(url)
-            slug = classification[2] if classification else (
-                url.split("/anime/stream/" if self.family ==
-                          "aniworld" else "/serie/", 1)[1].split("/", 1)[0]
+            slug = (
+                classification[2]
+                if classification
+                else (url.split("/anime/stream/" if self.family == "aniworld" else "/serie/", 1)[1].split("/", 1)[0])
             )
-            result = SeriesResult(self.host, self.family, url, slug)
+            family = self.family
+            result = SeriesResult(self.host, family, url, slug)
             result.ok = False
             return result
 
         family = self.family
         classification = classify_url(url)
-        slug = classification[2] if classification else (
-            url.split("/anime/stream/" if family ==
-                      "aniworld" else "/serie/", 1)[1].split("/", 1)[0]
+        slug = (
+            classification[2]
+            if classification
+            else (url.split("/anime/stream/" if family == "aniworld" else "/serie/", 1)[1].split("/", 1)[0])
         )
         result = SeriesResult(self.host, family, url, slug)
 
@@ -1125,13 +1177,17 @@ class DomainWorker:
             if family in ("aniworld", "sto"):
                 try:
                     text = await self._get(url)
-                    result.subscribed, result.watchlist = self._detect_subscription_status(
-                        text)
+                    result.subscribed, result.watchlist = self._detect_subscription_status(text)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Status check failed for %s: %s", url, exc)
 
-        logger.info("[%s] %s seasons %s action=%s",
-                    "OK" if result.ok else "FAIL", url, seasons, action)
+        logger.info(
+            "[%s] %s seasons %s action=%s",
+            "OK" if result.ok else "FAIL",
+            url,
+            seasons,
+            action,
+        )
         return result
 
 
@@ -1159,9 +1215,9 @@ async def process_batch(
     original = dict(grouped)
     grouped = deduplicate_family_mirrors(grouped, statuses)
     stats["skipped_hosts"] = [
-        {"host": host, "urls": len(
-            urls), "status": statuses.get(host, "unknown")}
-        for host, urls in original.items() if host not in grouped
+        {"host": host, "urls": len(urls), "status": statuses.get(host, "unknown")}
+        for host, urls in original.items()
+        if host not in grouped
     ]
 
     if not grouped:
@@ -1176,8 +1232,7 @@ async def process_batch(
             num_w = len(str(len(urls)))
             for idx, url in enumerate(urls, 1):
                 short = url.rsplit("/", 1)[-1] or url
-                print(
-                    f"    [{idx:>{num_w}}/{len(urls)}] {short} ...", end=" ", flush=True)
+                print(f"    [{idx:>{num_w}}/{len(urls)}] {short} ...", end=" ", flush=True)
                 result = await worker.mark_series(url, action)
                 results.append(result)
                 if result.ok:
@@ -1206,21 +1261,25 @@ def _print_run_summary(stats: dict, results: list[SeriesResult], action: str = "
     if results:
         term_w = max(shutil.get_terminal_size().columns - 12, 40)
         host_w = min(max(len(r.host) for r in results), term_w // 3)
-        series_w = min(max(len(r.name) for r in results), term_w // 3)
+        series_w = min(max(len(r.title or r.slug) for r in results), term_w // 3)
         result_w = min(max(len(r.line()) for r in results), term_w // 3)
 
         def _trunc(text, width):
-            return text if len(text) <= width else text[:width - 1] + '…'
+            return text if len(text) <= width else text[: width - 1] + "…"
 
         result_w = max(result_w, len("Result"))
         table_w = host_w + series_w + result_w + 6
-        sep = '─' * table_w
+        sep = "─" * table_w
 
-        print(
-            f"    {'Host':<{host_w}}  {'Series':<{series_w}}  {'Result':<{result_w}}")
+        print(f"    {'Host':<{host_w}}  {'Series':<{series_w}}  {'Result':<{result_w}}")
         print(f"    {'─' * host_w}  {'─' * series_w}  {'─' * result_w}")
         for r in results:
-            row = f"    {_trunc(r.host, host_w):<{host_w}}  {_trunc(r.name, series_w):<{series_w}}  {_trunc(r.line(), result_w):<{result_w}}"
+            series_label = r.title or r.slug
+            row = (
+                f"    {_trunc(r.host, host_w):<{host_w}}"
+                f"  {_trunc(series_label, series_w):<{series_w}}"
+                f"  {_trunc(r.line(), result_w):<{result_w}}"
+            )
             print(row.rstrip())
         print(sep)
 
@@ -1246,15 +1305,13 @@ def _print_run_summary(stats: dict, results: list[SeriesResult], action: str = "
 def _persist_failed_urls(stats: dict) -> None:
     Path(FAILED_URLS_FILE).parent.mkdir(parents=True, exist_ok=True)
     with open(FAILED_URLS_FILE, "w", encoding="utf-8") as f:
-        json.dump(stats.get("failed_urls", []),
-                  f, indent=2, ensure_ascii=False)
-    logger.info("Finished: %d successful, %d failed",
-                stats["successful"], stats["failed"])
+        json.dump(stats.get("failed_urls", []), f, indent=2, ensure_ascii=False)
+    logger.info("Finished: %d successful, %d failed", stats["successful"], stats["failed"])
 
 
 def _read_lines(path: str) -> list[str]:
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             return [line.rstrip("\n") for line in f]
     except FileNotFoundError:
         return []
@@ -1283,12 +1340,10 @@ def append_urls_to_scraper_lists(results: list[SeriesResult]) -> None:
                 f"  disable exporting for this family this run?"
             )
             if ask_yes_no(prompt, default=True):
-                logger.info(
-                    "Disabled %s export because path is missing", family)
+                logger.info("Disabled %s export because path is missing", family)
                 continue
             else:
-                logger.warning(
-                    "Proceeding without export target for %s", family)
+                logger.warning("Proceeding without export target for %s", family)
                 continue
 
         existing = set(_read_lines(export_path))
@@ -1304,7 +1359,10 @@ def append_urls_to_scraper_lists(results: list[SeriesResult]) -> None:
                 f.write(url + "\n")
         logger.info(
             "Appended %d URL(s) to %s scraper list: %s",
-            len(new_urls), family, export_path)
+            len(new_urls),
+            family,
+            export_path,
+        )
         print(f"  appended {len(new_urls)} new URL(s) → {export_path}")
 
 
@@ -1344,24 +1402,31 @@ def print_menu(
         max_status = term_w - host_w - 10
 
         def _trunc(text, width):
-            return text if len(text) <= width else text[:width - 1] + '…'
+            return text if len(text) <= width else text[: width - 1] + "…"
 
         state_w = max(len("State"), 1)
-        details_w = min(max_status, max(
-            len(_trunc(s[3:] if s.startswith("OK ") else s[5:]
-                if s.startswith("FAIL ") else s, max_status)) + 2
-            for s in statuses.values()
-        ))
+        details_w = min(
+            max_status,
+            max(
+                len(
+                    _trunc(
+                        (s[3:] if s.startswith("OK ") else s[5:] if s.startswith("FAIL ") else s),
+                        max_status,
+                    )
+                )
+                + 2
+                for s in statuses.values()
+            ),
+        )
         details_w = max(details_w, len("Details"))
         table_w = host_w + state_w + details_w + 6
-        sep = '─' * table_w
+        sep = "─" * table_w
 
         print(f"    {'Host':<{host_w}}  State{' ' * (state_w - 4)}  Details")
         print(f"    {'─' * host_w}  {'─' * state_w}  {'─' * details_w}")
         for host, status in sorted(statuses.items()):
             emoji = _status_emoji(status)
-            short = status[3:] if status.startswith(
-                "OK ") else status[5:] if status.startswith("FAIL ") else status
+            short = status[3:] if status.startswith("OK ") else status[5:] if status.startswith("FAIL ") else status
             marker = "  ← ACTIVE" if host in active_hosts else ""
             details = _trunc(f"{short}{marker}", max_status)
             row = f"    {_trunc(host, host_w):<{host_w}}  {emoji:<{state_w}}  {details:<{details_w}}"
@@ -1427,15 +1492,14 @@ def print_batch_summary_from_grouped(
 
 def validate_credentials_for_batch(urls_file: str) -> list[str]:
     grouped, _ = load_url_batches(urls_file)
-    used = {SUPPORTED_DOMAINS[host]
-            for host in grouped if host in SUPPORTED_DOMAINS}
+    used = {SUPPORTED_DOMAINS[host] for host in grouped if host in SUPPORTED_DOMAINS}
     return [family for family in used if not any(CREDENTIALS.get(family, {}).values())]
 
 
 def _batch_has_urls(urls_file: str) -> bool:
     if not os.path.exists(urls_file):
         return False
-    with open(urls_file, "r", encoding="utf-8") as f:
+    with open(urls_file, encoding="utf-8") as f:
         for line in f:
             stripped = line.strip()
             if stripped and not stripped.startswith("#"):
@@ -1454,9 +1518,7 @@ async def startup_host_check(urls_file: str) -> dict[str, str]:
     return statuses
 
 
-def deduplicate_family_mirrors(
-    grouped: dict[str, list[str]], statuses: dict[str, str]
-) -> dict[str, list[str]]:
+def deduplicate_family_mirrors(grouped: dict[str, list[str]], statuses: dict[str, str]) -> dict[str, list[str]]:
     """Keep only one reachable host per site family, preferring DOMAIN_ORDER."""
     selected: dict[str, list[str]] = {}
     seen_families: set[str] = set()
@@ -1506,37 +1568,41 @@ async def run_action(
                 try:
                     seasons = await worker.discover_seasons(url)
                     classification = classify_url(url)
-                    slug = classification[2] if classification else (
-                        url.split("/anime/stream/" if worker.family ==
-                                  "aniworld" else "/serie/", 1)[1].split("/", 1)[0]
+                    slug = (
+                        classification[2]
+                        if classification
+                        else (
+                            url.split(
+                                ("/anime/stream/" if worker.family == "aniworld" else "/serie/"),
+                                1,
+                            )[1].split("/", 1)[0]
+                        )
                     )
                     result = SeriesResult(host, worker.family, url, slug)
                     try:
                         series_text = await worker._get(url)
                         result.set_title(series_text)
                         if worker.family in ("aniworld", "sto"):
-                            result.subscribed, result.watchlist = worker._detect_subscription_status(
-                                series_text)
+                            result.subscribed, result.watchlist = worker._detect_subscription_status(series_text)
                     except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "Preview title extraction failed for %s: %s", url, exc)
+                        logger.warning("Preview title extraction failed for %s: %s", url, exc)
                     needs_sub_change = (
-                        action == "watched"
-                        and worker.family in ("aniworld", "sto")
-                        and result.subscribed is False
+                        action == "watched" and worker.family in ("aniworld", "sto") and result.subscribed is False
                     )
                     all_already = True
                     for season in seasons:
                         season_url = worker._season_url_from_slug(url, season)
                         before_watched, total = worker._count_episodes(await worker._get(season_url))
                         planned_after = total if action == "watched" else 0
-                        result.seasons.append({
-                            "season": season,
-                            "watched_before": before_watched,
-                            "watched_after": planned_after,
-                            "total": total,
-                            "ok": True,
-                        })
+                        result.seasons.append(
+                            {
+                                "season": season,
+                                "watched_before": before_watched,
+                                "watched_after": planned_after,
+                                "total": total,
+                                "ok": True,
+                            }
+                        )
                         if before_watched != planned_after:
                             all_already = False
                     status_extra = ""
@@ -1545,24 +1611,18 @@ async def run_action(
                         wl = "✓" if result.watchlist else "✗" if result.watchlist is False else "?"
                         status_extra = f" (Sub:{sub} WL:{wl})"
                     sub_badge = " ⚡" if needs_sub_change else ""
-                    before_eps = sum(
-                        s.get("watched_before", 0) for s in result.seasons)
-                    planned_eps = sum(
-                        s.get("watched_after", s.get("watched_before", 0))
-                        for s in result.seasons
-                    )
+                    before_eps = sum(s.get("watched_before", 0) for s in result.seasons)
+                    planned_eps = sum(s.get("watched_after", s.get("watched_before", 0)) for s in result.seasons)
                     seasons_tag = result.season_summary()
                     counter = f"{before_eps}/{result.total_episodes}"
                     if before_eps != planned_eps:
                         counter += f" → {planned_eps}/{result.total_episodes}"
                     if all_already and not needs_sub_change:
                         already_done_count += 1
-                        print(
-                            f"  {host}: {result.title or slug}{status_extra}{sub_badge} {seasons_tag} — {counter}")
+                        print(f"  {host}: {result.title or slug}{status_extra}{sub_badge} {seasons_tag} — {counter}")
                     else:
                         preview_results.append(result)
-                        print(
-                            f"  {host}: {result.title or slug}{status_extra}{sub_badge} {seasons_tag} — {counter}")
+                        print(f"  {host}: {result.title or slug}{status_extra}{sub_badge} {seasons_tag} — {counter}")
                         for line in result.detail_lines(action):
                             print(f"      {line.strip()}")
                 except Exception as exc:
@@ -1570,8 +1630,7 @@ async def run_action(
                     continue
 
     if not preview_results:
-        print(
-            f"\n  → nothing to do; all {already_done_count} series already at target state ({action}).")
+        print(f"\n  → nothing to do; all {already_done_count} series already at target state ({action}).")
         return
 
     if not ask_yes_no("\n  proceed with marking?", default=False):
@@ -1672,8 +1731,7 @@ async def import_urls(urls_file: str) -> None:
     print(f"\n  appended {len(new_urls_total)} new URL(s) → {urls_file}")
     for family, count in sorted(added_by_family.items()):
         print(f"    {family}: {count}")
-    logger.info("Imported %d URL(s) from scraper lists into %s",
-                len(new_urls_total), urls_file)
+    logger.info("Imported %d URL(s) from scraper lists into %s", len(new_urls_total), urls_file)
 
 
 async def export_urls(urls_file: str) -> None:
@@ -1728,7 +1786,7 @@ def _load_failed_urls() -> list[str]:
     if not os.path.exists(FAILED_URLS_FILE):
         return []
     try:
-        with open(FAILED_URLS_FILE, "r", encoding="utf-8") as f:
+        with open(FAILED_URLS_FILE, encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, list):
             return [str(u) for u in data if u]
@@ -1782,10 +1840,13 @@ async def _detect_and_add_input(urls_file: str) -> str:
 
     if user_input.startswith("http://") or user_input.startswith("https://"):
         Path(DEFAULT_BATCH_FILE).parent.mkdir(parents=True, exist_ok=True)
-        if DEFAULT_BATCH_FILE != urls_file and _batch_has_urls(DEFAULT_BATCH_FILE):
-            if not ask_yes_no(f"  overwrite {DEFAULT_BATCH_FILE}?", default=False):
-                print("  cancelled.")
-                return urls_file
+        if (
+            urls_file != DEFAULT_BATCH_FILE
+            and _batch_has_urls(DEFAULT_BATCH_FILE)
+            and not ask_yes_no(f"  overwrite {DEFAULT_BATCH_FILE}?", default=False)
+        ):
+            print("  cancelled.")
+            return urls_file
         with open(DEFAULT_BATCH_FILE, "w", encoding="utf-8") as f:
             f.write(user_input + "\n")
         print(f"  wrote 1 URL → {DEFAULT_BATCH_FILE}")
@@ -1793,8 +1854,7 @@ async def _detect_and_add_input(urls_file: str) -> str:
 
     candidate = user_input
     if not os.path.exists(candidate):
-        candidate = os.path.join(
-            os.path.dirname(DEFAULT_BATCH_FILE), user_input)
+        candidate = os.path.join(os.path.dirname(DEFAULT_BATCH_FILE), user_input)
     if not os.path.exists(candidate):
         print(f"  ✗ file not found: {user_input}")
         return urls_file
@@ -1822,8 +1882,7 @@ async def main() -> None:
 
     while True:
         print_banner()
-        print_menu(urls_file, host_statuses,
-                   _has_failed_urls(), active_host_by_family)
+        print_menu(urls_file, host_statuses, _has_failed_urls(), active_host_by_family)
 
         choice = input("\n  enter number: ").strip()
         if choice == "0":
