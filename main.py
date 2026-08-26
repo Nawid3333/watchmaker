@@ -817,9 +817,13 @@ class DomainWorker:
             )
             if r.status_code not in _OK_POST_STATUS:
                 return False
-            # Verify on the series catalogue page, just like the BS scraper,
-            # because the homepage may not reliably render the logout link.
-            return self._is_logged_in(await self._get_soup(f"{base}/andere-serien"))
+            # The homepage carries section.navigation with the logout link, so
+            # verify there rather than on /andere-serien: that page is the full
+            # series catalogue, ~1.3 MB downloaded on every login purely to look
+            # for one anchor the 29 KB homepage already shows. _recover_session
+            # has always checked this family on the homepage, so this makes the
+            # two agree instead of trusting different pages for the same fact.
+            return self._is_logged_in(await self._get_soup(base))
 
         # aniworld + s.to family
         payload: dict[str, str] = {}

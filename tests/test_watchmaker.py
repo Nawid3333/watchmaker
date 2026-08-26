@@ -703,5 +703,101 @@ class TestActiveHostResolution(unittest.IsolatedAsyncioTestCase):
         )
 
 
+# ==================== login verification ====================
+# The logged-in bs homepage carries the logout link in section.navigation,
+# which is exactly what _LOGIN_MARKERS["bs"] selects. The username here is a
+# placeholder: the structure is what is being pinned.
+BS_LOGGED_IN_HOME = """
+<html><body>
+  <section class="navigation">
+    <div>Hallo<strong>ExampleUser</strong>!</div>
+    <a href="settings">Einstellungen</a>
+    <a href="messages">Nachrichten</a>
+    <a href="logout">Logout</a>
+  </section>
+</body></html>
+"""
+
+BS_LOGGED_OUT_HOME = """
+<html><body>
+  <section class="navigation">
+    <a href="login">Login</a>
+    <a href="register">Registrieren</a>
+  </section>
+</body></html>
+"""
+
+
+class LoginRecordingWorker(DomainWorker):
+    """DomainWorker with the network replaced, recording every URL fetched."""
+
+    def __init__(self, host, verify_page, login_page='<input name="security_token" value="t">'):
+        super().__init__(host)
+        # Never let the real .env credentials near a test.
+        self.creds = {"username": "u", "password": "p", "email": "u@example.test"}
+        self.verify_page = verify_page
+        self.login_page = login_page
+        self.fetched = []
+
+    async def _get_soup(self, url):
+        self.fetched.append(url)
+        return soup(self.login_page if url.endswith("/login") else self.verify_page)
+
+    async def _post(self, url, **kwargs):
+        return _FakeResponse(200, "")
+
+
+class TestLoginStateDetection(unittest.TestCase):
+    def test_the_bs_homepage_navigation_shows_a_logged_in_session(self):
+        worker = LoginRecordingWorker("burningseries.ac", BS_LOGGED_IN_HOME)
+        self.assertTrue(worker._is_logged_in(soup(BS_LOGGED_IN_HOME)))
+
+    def test_a_logout_link_outside_the_navigation_still_counts(self):
+        """The documented fallback for layouts that move the link."""
+        worker = LoginRecordingWorker("burningseries.ac", BS_LOGGED_IN_HOME)
+        stray = '<html><body><div><a href="logout">Logout</a></div></body></html>'
+        self.assertTrue(worker._is_logged_in(soup(stray)))
+
+    def test_a_logged_out_homepage_is_not_mistaken_for_a_session(self):
+        worker = LoginRecordingWorker("burningseries.ac", BS_LOGGED_OUT_HOME)
+        self.assertFalse(worker._is_logged_in(soup(BS_LOGGED_OUT_HOME)))
+
+
+class TestBsLoginVerification(unittest.IsolatedAsyncioTestCase):
+    """Which page proves the bs login worked.
+
+    It used to be /andere-serien -- the full series catalogue, ~1.3 MB pulled
+    on every login just to find one anchor. The homepage shows the same
+    section.navigation logout link in 29 KB, and _recover_session has always
+    checked this family on the homepage, so verifying there makes the two
+    agree instead of trusting different pages for the same fact.
+    """
+
+    async def test_the_login_is_verified_on_the_homepage(self):
+        worker = LoginRecordingWorker("burningseries.ac", BS_LOGGED_IN_HOME)
+
+        self.assertTrue(await worker._login_form())
+        self.assertEqual(
+            worker.fetched,
+            ["https://burningseries.ac/login", "https://burningseries.ac"],
+        )
+
+    async def test_the_catalogue_page_is_never_downloaded_to_check_a_login(self):
+        worker = LoginRecordingWorker("burningseries.ac", BS_LOGGED_IN_HOME)
+        await worker._login_form()
+
+        self.assertNotIn(
+            "andere-serien",
+            " ".join(worker.fetched),
+            "a 1.3 MB catalogue page must not be fetched to look for a logout link",
+        )
+
+    async def test_a_failed_bs_login_is_still_reported_as_failed(self):
+        """Cheaper verification must not become weaker verification."""
+        worker = LoginRecordingWorker("burningseries.ac", BS_LOGGED_OUT_HOME)
+
+        self.assertFalse(await worker._login_form())
+
+
 if __name__ == "__main__":
     unittest.main()
