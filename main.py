@@ -1313,11 +1313,20 @@ async def process_batch(
     results: list[SeriesResult] = list(presets)
     report = RunReport(total_urls=sum(len(p) for p in plans_by_host.values()) + len(presets))
 
-    for host, plans in plans_by_host.items():
-        print(f"\n  → {host}: {len(plans)} series")
-        logger.info("Processing %s (%d URLs)", host, len(plans))
+    hosts = list(plans_by_host)
+    async with contextlib.AsyncExitStack() as stack:
+        workers = [await stack.enter_async_context(DomainWorker(host)) for host in hosts]
+        # Same reason as in _preview: the logins are independent servers and
+        # were the whole pause between one host's block and the next. The
+        # marking itself stays strictly sequential, one series at a time, so
+        # nothing about what gets written changes.
+        await asyncio.gather(*(worker.login() for worker in workers))
 
-        async with DomainWorker(host) as worker:
+        for host, worker in zip(hosts, workers, strict=True):
+            plans = plans_by_host[host]
+            print(f"\n  → {host}: {len(plans)} series")
+            logger.info("Processing %s (%d URLs)", host, len(plans))
+
             num_w = len(str(len(plans)))
             for idx, plan in enumerate(plans, 1):
                 label = plan.title or plan.slug
@@ -1642,10 +1651,21 @@ async def _preview(
     done: list[SeriesResult] = []
     broken: list[SeriesResult] = []
 
-    for host, urls in sorted(grouped.items()):
-        family = SUPPORTED_DOMAINS.get(host, "?")
-        async with DomainWorker(host) as worker:
-            if not await worker.login():
+    hosts = sorted(grouped)
+    async with contextlib.AsyncExitStack() as stack:
+        workers = [await stack.enter_async_context(DomainWorker(host)) for host in hosts]
+        # Log every host in at once. Each is a different server, so this cannot
+        # affect any single site's rate limits, and it turns the pause between
+        # one domain and the next -- a fresh TLS handshake plus a three-request
+        # login -- into one pause covering all of them. login() reports failure
+        # by returning False rather than raising, so a host that cannot be
+        # reached does not disturb the others.
+        await asyncio.gather(*(worker.login() for worker in workers))
+
+        for host, worker in zip(hosts, workers, strict=True):
+            urls = grouped[host]
+            family = SUPPORTED_DOMAINS.get(host, "?")
+            if not worker.logged_in:
                 print(f"  ✗ could not log in to {host} — {len(urls)} series skipped")
                 # Record them as failures rather than dropping them silently,
                 # so they land in the retry list.

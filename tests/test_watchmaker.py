@@ -7,6 +7,7 @@ wrong result: URL classification, batch-file rewriting, season discovery,
 episode counting, and the post-mark verification.
 """
 
+import asyncio
 import os
 import sys
 import tempfile
@@ -20,6 +21,7 @@ import httpx  # noqa: E402
 from bs4 import BeautifulSoup  # noqa: E402
 
 import main  # noqa: E402
+from config import SUPPORTED_DOMAINS  # noqa: E402
 from main import (  # noqa: E402
     ACTION_UNWATCHED,
     ACTION_WATCHED,
@@ -797,6 +799,185 @@ class TestBsLoginVerification(unittest.IsolatedAsyncioTestCase):
         worker = LoginRecordingWorker("burningseries.ac", BS_LOGGED_OUT_HOME)
 
         self.assertFalse(await worker._login_form())
+
+
+# ==================== per-host flow ====================
+class ScriptedWorker:
+    """Stands in for DomainWorker, recording the order things happen in."""
+
+    events: list[tuple] = []
+    made: list["ScriptedWorker"] = []
+    refuse_login: set[str] = set()
+
+    def __init__(self, host):
+        self.host = host
+        self.family = SUPPORTED_DOMAINS.get(host, "?")
+        self.logged_in = False
+        self.closed = False
+        self.needs_subscribe = False
+        ScriptedWorker.made.append(self)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        self.closed = True
+        return False
+
+    async def login(self):
+        ScriptedWorker.events.append(("login-start", self.host))
+        await asyncio.sleep(0.02)
+        ScriptedWorker.events.append(("login-end", self.host))
+        if self.host in ScriptedWorker.refuse_login:
+            return False
+        self.logged_in = True
+        return True
+
+    def _result(self, url, action, slug):
+        return SeriesResult(
+            self.host,
+            self.family,
+            url,
+            slug,
+            action=action,
+            seasons=[SeasonOutcome(season=1, total=5, watched_before=5, watched_after=5)],
+            title=slug,
+        )
+
+    async def inspect_series(self, url, action):
+        ScriptedWorker.events.append(("inspect", self.host, url))
+        slug = url.rstrip("/").split("/")[-1]
+        plan = main.SeriesPlan(url=url, host=self.host, family=self.family, slug=slug, seasons=[1], title=slug)
+        return self._result(url, action, slug), plan
+
+    async def mark_series(self, plan, action):
+        ScriptedWorker.events.append(("mark", self.host, plan.slug))
+        return self._result(plan.url, action, plan.slug)
+
+
+class HostFlowCase(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        ScriptedWorker.events = []
+        ScriptedWorker.made = []
+        ScriptedWorker.refuse_login = set()
+        patcher = mock.patch.object(main, "DomainWorker", ScriptedWorker)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def starts_before_any(events, kind):
+        """Index of the first event of *kind*, or len(events) if absent."""
+        for i, ev in enumerate(events):
+            if ev[0] == kind:
+                return i
+        return len(events)
+
+
+class TestPreviewAcrossHosts(HostFlowCase):
+    """Moving from one domain to the next used to cost a fresh TLS handshake
+    plus a three-request login, paid one host at a time with nothing else
+    happening. The hosts are separate servers, so those logins now overlap."""
+
+    GROUPED = {
+        "serienstream.to": ["https://serienstream.to/serie/one"],
+        "burningseries.ac": ["https://burningseries.ac/serie/Two"],
+    }
+
+    async def test_the_logins_for_different_hosts_overlap(self):
+        await main._preview(ACTION_WATCHED, dict(self.GROUPED))
+
+        kinds = [e[0] for e in ScriptedWorker.events]
+        # Ordering, not wall time, so this cannot go flaky: run one host at a
+        # time and the first login-end lands before the second login-start.
+        self.assertEqual(kinds[:2], ["login-start", "login-start"])
+
+    async def test_no_series_is_inspected_before_every_host_is_logged_in(self):
+        await main._preview(ACTION_WATCHED, dict(self.GROUPED))
+
+        events = ScriptedWorker.events
+        self.assertLess(
+            max(i for i, e in enumerate(events) if e[0] == "login-end"),
+            self.starts_before_any(events, "inspect"),
+        )
+
+    async def test_hosts_are_still_previewed_in_a_stable_sorted_order(self):
+        await main._preview(ACTION_WATCHED, dict(self.GROUPED))
+
+        inspected = [e[1] for e in ScriptedWorker.events if e[0] == "inspect"]
+        self.assertEqual(inspected, sorted(self.GROUPED))
+
+    async def test_a_host_that_cannot_log_in_does_not_stop_the_others(self):
+        ScriptedWorker.refuse_login = {"burningseries.ac"}
+
+        todo, done, broken = await main._preview(ACTION_WATCHED, dict(self.GROUPED))
+
+        self.assertEqual([r.url for r in broken], ["https://burningseries.ac/serie/Two"])
+        self.assertEqual([r.note for r in broken], ["login failed"])
+        inspected = [e[1] for e in ScriptedWorker.events if e[0] == "inspect"]
+        self.assertEqual(inspected, ["serienstream.to"])
+        self.assertEqual(len(done), 1, "the working host is still previewed")
+        self.assertEqual(todo, [])
+
+    async def test_every_worker_is_closed(self):
+        await main._preview(ACTION_WATCHED, dict(self.GROUPED))
+
+        self.assertEqual(len(ScriptedWorker.made), 2)
+        self.assertTrue(all(w.closed for w in ScriptedWorker.made))
+
+
+class TestProcessBatchAcrossHosts(HostFlowCase):
+    def setUp(self):
+        super().setUp()
+        # process_batch reconciles the shared failed-urls file; never let a
+        # test write into the real data directory.
+        patcher = mock.patch.object(main, "_persist_failed_urls", lambda *a, **kw: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _plans(self):
+        return {
+            "serienstream.to": [
+                main.SeriesPlan("https://serienstream.to/serie/one", "serienstream.to", "sto", "one", [1], "one"),
+            ],
+            "burningseries.ac": [
+                main.SeriesPlan("https://burningseries.ac/serie/Two", "burningseries.ac", "bs", "Two", [1], "Two"),
+            ],
+        }
+
+    async def test_the_logins_overlap_before_any_marking_starts(self):
+        await main.process_batch(ACTION_WATCHED, self._plans(), [])
+
+        events = ScriptedWorker.events
+        self.assertEqual([e[0] for e in events[:2]], ["login-start", "login-start"])
+        self.assertLess(
+            max(i for i, e in enumerate(events) if e[0] == "login-end"),
+            self.starts_before_any(events, "mark"),
+        )
+
+    async def test_marking_itself_stays_one_series_at_a_time(self):
+        plans = self._plans()
+        plans["serienstream.to"].append(
+            main.SeriesPlan("https://serienstream.to/serie/three", "serienstream.to", "sto", "three", [1], "three")
+        )
+
+        await main.process_batch(ACTION_WATCHED, plans, [])
+
+        marks = [(e[1], e[2]) for e in ScriptedWorker.events if e[0] == "mark"]
+        self.assertEqual(
+            marks,
+            [
+                ("serienstream.to", "one"),
+                ("serienstream.to", "three"),
+                ("burningseries.ac", "Two"),
+            ],
+            "hosts keep their order and each host's series stay sequential",
+        )
+
+    async def test_every_worker_is_closed(self):
+        await main.process_batch(ACTION_WATCHED, self._plans(), [])
+
+        self.assertEqual(len(ScriptedWorker.made), 2)
+        self.assertTrue(all(w.closed for w in ScriptedWorker.made))
 
 
 if __name__ == "__main__":
