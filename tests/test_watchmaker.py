@@ -12,9 +12,11 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import httpx  # noqa: E402
 from bs4 import BeautifulSoup  # noqa: E402
 
 import main  # noqa: E402
@@ -542,6 +544,162 @@ class TestSeasonUrls(unittest.TestCase):
         self.assertEqual(
             DomainWorker("186.2.175.5").season_url("foo", 1),
             "http://186.2.175.5/serie/foo/staffel-1",
+        )
+
+
+# ==================== Host reachability ====================
+class _FakeResponse:
+    def __init__(self, status_code: int = 200, text: str = "") -> None:
+        self.status_code = status_code
+        self.text = text
+
+
+class _FakeClient:
+    """Stands in for httpx.AsyncClient and records what was fetched."""
+
+    def __init__(self, response=None, exc=None) -> None:
+        self._response = response
+        self._exc = exc
+        self.requested: list[str] = []
+
+    async def get(self, url, **kwargs):
+        self.requested.append(str(url))
+        if self._exc is not None:
+            raise self._exc
+        return self._response
+
+
+LOGIN_PAGE = '<html><form><input type="password" name="pass"></form></html>'
+PARKED_PAGE = "<html><body><h1>Domain for sale</h1></body></html>"
+
+
+class TestLoginPageDetection(unittest.TestCase):
+    """A host is only usable if it really is the site.
+
+    The check used to be a HEAD of the homepage accepting any status under
+    400, which a parked domain or a proxy error page passes exactly as
+    happily as the real thing.
+    """
+
+    def test_a_password_field_identifies_a_login_page(self):
+        for html in (
+            '<input type="password">',
+            "<input type='password'>",
+            "<input type=password>",
+            LOGIN_PAGE,
+        ):
+            with self.subTest(html):
+                self.assertTrue(main._looks_like_login_page(html))
+
+    def test_wording_alone_is_enough_in_either_language(self):
+        self.assertTrue(main._looks_like_login_page("<body>Bitte anmelden</body>"))
+        self.assertTrue(main._looks_like_login_page("<body>Please Login</body>"))
+
+    def test_a_page_that_is_not_a_login_page_is_rejected(self):
+        for html in ("", PARKED_PAGE, "<body>502 Bad Gateway</body>", "not markup"):
+            with self.subTest(html):
+                self.assertFalse(main._looks_like_login_page(html))
+
+
+class TestCheckHost(unittest.IsolatedAsyncioTestCase):
+    async def test_a_working_host_is_probed_on_its_login_page(self):
+        client = _FakeClient(_FakeResponse(200, LOGIN_PAGE))
+        ok, reason = await main.check_host(client, "aniworld.to")
+
+        self.assertTrue(ok)
+        self.assertEqual(reason, "GET 200")
+        # The very URL _login_form posts to, so the probe tests what matters.
+        self.assertEqual(client.requested, ["https://aniworld.to/login"])
+
+    async def test_a_host_that_answers_but_has_no_login_form_is_unusable(self):
+        client = _FakeClient(_FakeResponse(200, PARKED_PAGE))
+        ok, reason = await main.check_host(client, "aniworld.to")
+
+        self.assertFalse(ok)
+        self.assertEqual(reason, "no login form")
+
+    async def test_an_error_status_is_unusable(self):
+        client = _FakeClient(_FakeResponse(503, LOGIN_PAGE))
+        ok, reason = await main.check_host(client, "aniworld.to")
+
+        self.assertFalse(ok)
+        self.assertEqual(reason, "GET 503")
+
+    async def test_a_timeout_is_unusable(self):
+        client = _FakeClient(exc=httpx.TimeoutException("slow"))
+        ok, reason = await main.check_host(client, "aniworld.to")
+
+        self.assertFalse(ok)
+        self.assertEqual(reason, "timeout")
+
+    async def test_a_raw_ip_host_is_probed_over_http(self):
+        client = _FakeClient(_FakeResponse(200, LOGIN_PAGE))
+        await main.check_host(client, "186.2.175.5")
+
+        self.assertEqual(client.requested, ["http://186.2.175.5/login"])
+
+
+class TestActiveHostResolution(unittest.IsolatedAsyncioTestCase):
+    """Which mirror ends up in the batch file on disk.
+
+    resolve_active_hosts rewrites the user's series_urls.txt to the host it
+    picks, before any login is attempted. A host that answers but cannot serve
+    a login page must therefore never be picked while a working mirror exists,
+    or the bad mirror is baked into the file for every later run too.
+    """
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+
+    def _batch(self, *urls: str) -> str:
+        path = os.path.join(self._dir.name, "series_urls.txt")
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write("".join(url + "\n" for url in urls))
+        return path
+
+    @staticmethod
+    def _statuses(usable: set[str]):
+        async def fake_check_hosts(hosts):
+            return {h: ("OK (GET 200)" if h in usable else "FAIL (no login form)") for h in hosts}
+
+        return fake_check_hosts
+
+    async def test_an_unusable_mirror_is_not_written_into_the_batch_file(self):
+        path = self._batch("https://aniworld.to/anime/stream/demo")
+
+        with mock.patch.object(main, "check_hosts", self._statuses({"aniworld.cc"})):
+            _resolved, _statuses, active = await main.resolve_active_hosts(path)
+
+        self.assertEqual(active.get("aniworld"), "aniworld.cc")
+        self.assertEqual(
+            _read_lines(path),
+            ["https://aniworld.cc/anime/stream/demo"],
+            "the batch file must point at the usable mirror",
+        )
+
+    async def test_a_usable_first_choice_is_left_alone(self):
+        path = self._batch("https://aniworld.to/anime/stream/demo")
+
+        with mock.patch.object(main, "check_hosts", self._statuses({"aniworld.to", "aniworld.cc"})):
+            _resolved, _statuses, active = await main.resolve_active_hosts(path)
+
+        self.assertEqual(active.get("aniworld"), "aniworld.to")
+        self.assertEqual(_read_lines(path), ["https://aniworld.to/anime/stream/demo"])
+
+    async def test_a_family_with_no_usable_mirror_is_skipped_not_rewritten(self):
+        path = self._batch("https://aniworld.to/anime/stream/demo")
+
+        with mock.patch.object(main, "check_hosts", self._statuses(set())):
+            resolved, statuses, active = await main.resolve_active_hosts(path)
+
+        self.assertNotIn("aniworld", active)
+        self.assertEqual(resolved, {})
+        self.assertIn("no reachable aniworld mirror", statuses["aniworld.to"])
+        self.assertEqual(
+            _read_lines(path),
+            ["https://aniworld.to/anime/stream/demo"],
+            "nothing to migrate to means the file must be left untouched",
         )
 
 

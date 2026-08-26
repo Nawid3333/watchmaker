@@ -377,23 +377,50 @@ def load_url_batches(source: str) -> tuple[dict[str, list[str]], list[dict]]:
 
 
 # ==================== HOST CHECK ====================
+_PASSWORD_INPUT_RE = re.compile(r"<input[^>]+type\s*=\s*['\"]?password", re.IGNORECASE)
+
+
+def _looks_like_login_page(html: str) -> bool:
+    """True when a response really is one of these sites' login pages.
+
+    A password field is what a login page has and a parked domain, a proxy
+    error page or a stale mirror does not, and unlike a word it does not
+    depend on the page's language. The text checks stay on as alternatives, so
+    a redesign that renamed the input would still pass here.
+    """
+    if _PASSWORD_INPUT_RE.search(html):
+        return True
+    lowered = html.lower()
+    return "login" in lowered or "anmelden" in lowered
+
+
 async def check_host(client: httpx.AsyncClient, host: str) -> tuple[bool, str]:
-    url = base_url(host)
-    for method in ("HEAD", "GET"):
-        try:
-            r = await client.request(method, url)
-            if r.status_code < 400:
-                return True, f"{method} {r.status_code}"
-            if method == "HEAD" and r.status_code in (403, 405, 501):
-                continue  # some mirrors reject HEAD outright
-            return False, f"{method} {r.status_code}"
-        except httpx.TimeoutException:
-            if method == "GET":
-                return False, "timeout"
-        except Exception as exc:  # noqa: BLE001
-            if method == "GET":
-                return False, exc.__class__.__name__
-    return False, "unreachable"
+    """Is this host usable, not merely answering?
+
+    This used to HEAD the homepage and accept any status under 400, which a
+    parked domain or a proxy error page passes as readily as the real site.
+    That matters here because the mirror chosen from this result is written
+    back into the batch file on disk before a single login is attempted: pick
+    a host that answers but is not the site and every URL for that family
+    fails, and the file now points at the bad mirror for every later run too.
+
+    Fetching the login page asks the question this program actually needs --
+    can I log in here -- against the very URL _login_form posts to. It is
+    unauthenticated, so it uses no credentials, and it costs one small GET
+    (6-30 KB) per host, all of them concurrent.
+    """
+    url = f"{base_url(host)}/login"
+    try:
+        r = await client.get(url)
+    except httpx.TimeoutException:
+        return False, "timeout"
+    except Exception as exc:  # noqa: BLE001
+        return False, exc.__class__.__name__
+    if r.status_code >= 400:
+        return False, f"GET {r.status_code}"
+    if not _looks_like_login_page(r.text):
+        return False, "no login form"
+    return True, f"GET {r.status_code}"
 
 
 async def check_hosts(hosts: list[str]) -> dict[str, str]:
