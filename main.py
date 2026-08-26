@@ -452,6 +452,7 @@ async def check_hosts(hosts: list[str]) -> dict[str, str]:
 
 async def resolve_active_hosts(
     urls_file: str,
+    preloaded: tuple[dict[str, list[str]], list[dict]] | None = None,
 ) -> tuple[dict[str, list[str]], dict[str, str], dict[str, str]]:
     """Pick one reachable host per site family in the batch and rewrite URLs to it.
 
@@ -463,7 +464,11 @@ async def resolve_active_hosts(
     ``active_host_by_family`` maps each family in the batch to the host that will
     actually be used, so the UI can highlight it.
     """
-    grouped, _rejected = load_url_batches(urls_file)
+    # Reuse the caller's parse when it has just read this same file.
+    # Startup parses the batch once for its summary and then landed here
+    # and parsed it again, which also logged every duplicate-URL notice
+    # a second time.
+    grouped, _rejected = preloaded if preloaded is not None else load_url_batches(urls_file)
 
     families_in_batch = {SUPPORTED_DOMAINS[host] for host in grouped if host in SUPPORTED_DOMAINS}
     hosts_to_check = [host for host in DOMAIN_ORDER if SUPPORTED_DOMAINS.get(host) in families_in_batch]
@@ -1942,18 +1947,27 @@ async def main() -> None:
     urls_file = DEFAULT_BATCH_FILE
     Path(urls_file).parent.mkdir(parents=True, exist_ok=True)
 
-    initial_grouped, rejected = load_url_batches(urls_file)
+    batch = load_url_batches(urls_file)
+    initial_grouped, rejected = batch
     print_banner()
     print_batch_summary(initial_grouped, header="loaded batch", rejected=rejected)
 
     print("\n  → checking hosts ...")
-    resolved, host_statuses, active_host_by_family = await resolve_active_hosts(urls_file)
+    resolved, host_statuses, active_host_by_family = await resolve_active_hosts(
+        urls_file, preloaded=batch
+    )
 
     async def refresh() -> None:
         nonlocal resolved, host_statuses, active_host_by_family, rejected
         print("\n  → refreshing host resolution ...")
-        resolved, host_statuses, active_host_by_family = await resolve_active_hosts(urls_file)
-        _, rejected = load_url_batches(urls_file)
+        batch = load_url_batches(urls_file)
+        rejected = batch[1]
+        # Reusing this parse across the rewrite resolve_active_hosts may do
+        # is safe: _rewrite_batch_urls swaps mapped URLs in place and leaves
+        # comments and unsupported lines -- the rejected ones -- untouched.
+        resolved, host_statuses, active_host_by_family = await resolve_active_hosts(
+            urls_file, preloaded=batch
+        )
 
     while True:
         print_banner()

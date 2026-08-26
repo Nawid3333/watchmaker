@@ -980,5 +980,50 @@ class TestProcessBatchAcrossHosts(HostFlowCase):
         self.assertTrue(all(w.closed for w in ScriptedWorker.made))
 
 
+class TestBatchIsParsedOnce(unittest.IsolatedAsyncioTestCase):
+    """Startup used to parse the batch file twice.
+
+    main() read it for the "loaded batch" summary and resolve_active_hosts
+    then read the same unchanged file again, so a single run logged every
+    duplicate-URL notice twice -- and would report any malformed line twice
+    as well.
+    """
+
+    def setUp(self):
+        self.calls = []
+
+        def counting_load(path):
+            self.calls.append(path)
+            return {"serienstream.to": ["https://serienstream.to/serie/x"]}, []
+
+        async def fake_check_hosts(hosts):
+            return dict.fromkeys(hosts, "OK (GET 200)")
+
+        self.counting_load = counting_load
+        for target, replacement in (
+            ("load_url_batches", counting_load),
+            ("check_hosts", fake_check_hosts),
+        ):
+            patcher = mock.patch.object(main, target, replacement)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    async def test_a_preloaded_batch_is_not_parsed_again(self):
+        batch = self.counting_load("batch.txt")  # stands in for the caller's parse
+        self.assertEqual(len(self.calls), 1)
+
+        await main.resolve_active_hosts("batch.txt", preloaded=batch)
+
+        self.assertEqual(
+            len(self.calls), 1, "resolve_active_hosts must not re-read a file the caller just parsed"
+        )
+
+    async def test_without_a_preloaded_batch_the_file_is_still_read(self):
+        """Callers that have not already parsed it must keep working."""
+        await main.resolve_active_hosts("batch.txt")
+
+        self.assertEqual(self.calls, ["batch.txt"])
+
+
 if __name__ == "__main__":
     unittest.main()
