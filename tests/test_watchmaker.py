@@ -8,6 +8,7 @@ episode counting, and the post-mark verification.
 """
 
 import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -21,6 +22,13 @@ import httpx  # noqa: E402
 from bs4 import BeautifulSoup  # noqa: E402
 
 import main  # noqa: E402
+
+# main.py prints box-drawing characters and arrows. main() calls
+# _configure_console() before any of that; the tests call the printing
+# functions directly, so without this the whole suite errors out on a default
+# Windows console (cp1252) with UnicodeEncodeError -- a failure about the
+# terminal, not about the code under test.
+main._configure_console()
 from config import SUPPORTED_DOMAINS  # noqa: E402
 from main import (  # noqa: E402
     ACTION_UNWATCHED,
@@ -850,8 +858,15 @@ class ScriptedWorker:
         plan = main.SeriesPlan(url=url, host=self.host, family=self.family, slug=slug, seasons=[1], title=slug)
         return self._result(url, action, slug), plan
 
+    # Marking has to contain a real await point or the tasks run straight
+    # through in submission order and never interleave, which would make any
+    # assertion about concurrency vacuous.
+    mark_delay: float = 0
+
     async def mark_series(self, plan, action):
         ScriptedWorker.events.append(("mark", self.host, plan.slug))
+        await asyncio.sleep(ScriptedWorker.mark_delay)
+        ScriptedWorker.events.append(("mark-end", self.host, plan.slug))
         return self._result(plan.url, action, plan.slug)
 
 
@@ -954,23 +969,88 @@ class TestProcessBatchAcrossHosts(HostFlowCase):
             self.starts_before_any(events, "mark"),
         )
 
-    async def test_marking_itself_stays_one_series_at_a_time(self):
+    async def test_each_host_marks_one_series_at_a_time(self):
+        """The guarantee that must survive running the hosts together: no
+        single site ever sees two marks in flight from this run."""
         plans = self._plans()
         plans["serienstream.to"].append(
             main.SeriesPlan("https://serienstream.to/serie/three", "serienstream.to", "sto", "three", [1], "three")
         )
+        ScriptedWorker.mark_delay = 0.01
+        self.addCleanup(setattr, ScriptedWorker, "mark_delay", 0)
 
         await main.process_batch(ACTION_WATCHED, plans, [])
 
-        marks = [(e[1], e[2]) for e in ScriptedWorker.events if e[0] == "mark"]
+        in_flight: dict[str, int] = {}
+        for kind, host, _slug in [e for e in ScriptedWorker.events if e[0] in ("mark", "mark-end")]:
+            if kind == "mark":
+                in_flight[host] = in_flight.get(host, 0) + 1
+                self.assertLessEqual(in_flight[host], 1, f"{host} had two marks in flight at once")
+            else:
+                in_flight[host] -= 1
+
+    async def test_each_host_keeps_its_own_series_in_order(self):
+        plans = self._plans()
+        plans["serienstream.to"].append(
+            main.SeriesPlan("https://serienstream.to/serie/three", "serienstream.to", "sto", "three", [1], "three")
+        )
+        ScriptedWorker.mark_delay = 0.01
+        self.addCleanup(setattr, ScriptedWorker, "mark_delay", 0)
+
+        await main.process_batch(ACTION_WATCHED, plans, [])
+
+        sto = [e[2] for e in ScriptedWorker.events if e[0] == "mark" and e[1] == "serienstream.to"]
+        self.assertEqual(sto, ["one", "three"])
+
+    async def test_the_hosts_actually_overlap(self):
+        """The point of the change: finishing one host must not be what
+        starts the next. Asserted on event ordering, not wall-clock time."""
+        plans = self._plans()
+        plans["serienstream.to"].append(
+            main.SeriesPlan("https://serienstream.to/serie/three", "serienstream.to", "sto", "three", [1], "three")
+        )
+        ScriptedWorker.mark_delay = 0.02
+        self.addCleanup(setattr, ScriptedWorker, "mark_delay", 0)
+
+        await main.process_batch(ACTION_WATCHED, plans, [])
+
+        marks = [e for e in ScriptedWorker.events if e[0] in ("mark", "mark-end")]
+        overlapped = False
+        open_hosts: set[str] = set()
+        for kind, host, _slug in marks:
+            if kind == "mark":
+                if open_hosts - {host}:
+                    overlapped = True
+                open_hosts.add(host)
+            else:
+                open_hosts.discard(host)
+        self.assertTrue(overlapped, "hosts were still marked one whole host after another")
+
+    async def test_results_are_ordered_by_host_not_by_who_finished_first(self):
+        """The report and the failed-URL file are built from this list, so it
+        must not depend on which server happened to answer sooner.
+
+        The two hosts deliberately carry different numbers of series, so that
+        any reordering -- by completion, by size, by anything other than the
+        host order -- changes the result and is caught.
+        """
+        plans = self._plans()
+        for name in ("three", "four"):
+            plans["serienstream.to"].append(
+                main.SeriesPlan(
+                    f"https://serienstream.to/serie/{name}", "serienstream.to", "sto", name, [1], name
+                )
+            )
+        ScriptedWorker.mark_delay = 0.01
+        self.addCleanup(setattr, ScriptedWorker, "mark_delay", 0)
+
+        _report, results = await main.process_batch(ACTION_WATCHED, plans, [])
+
+        # serienstream.to has 3 series and finishes last; it must still come
+        # first, because that is the order the hosts were given in.
         self.assertEqual(
-            marks,
-            [
-                ("serienstream.to", "one"),
-                ("serienstream.to", "three"),
-                ("burningseries.ac", "Two"),
-            ],
-            "hosts keep their order and each host's series stay sequential",
+            [r.host for r in results],
+            ["serienstream.to"] * 3 + ["burningseries.ac"],
         )
 
     async def test_every_worker_is_closed(self):
@@ -1024,6 +1104,402 @@ class TestBatchIsParsedOnce(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.calls, ["batch.txt"])
 
+
+# ==================== batch file sections / option 7 ====================
+class SectionCase(unittest.TestCase):
+    """A URL line directly under a `# KEEP` tag (no blank line between) is
+    permanent; every other URL line is temporary."""
+
+    KEEP = "# KEEP"
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = os.path.join(self.dir.name, "series_urls.txt")
+
+    def write(self, *lines):
+        Path(self.path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def read(self):
+        return Path(self.path).read_text(encoding="utf-8").splitlines()
+
+    def urls(self, lines=None):
+        lines = self.read() if lines is None else lines
+        return [ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith("#")]
+
+
+class TestClassifyBatchLines(SectionCase):
+    def test_a_file_without_a_tag_is_entirely_temporary(self):
+        """Every batch file written before this feature has no tag."""
+        permanent = main._classify_batch_lines(["https://a", "https://b"])
+        self.assertEqual(permanent, [False, False])
+
+    def test_a_tag_marks_only_the_line_directly_below_it(self):
+        permanent = main._classify_batch_lines(["https://a", self.KEEP, "https://b"])
+        self.assertEqual(permanent, [False, True, True])
+
+    def test_the_tag_is_recognised_however_it_was_hand_edited(self):
+        """It exists to be edited by hand, so spacing and case must not matter."""
+        for variant in ("# KEEP", "#keep", "#  KEEP", "   # KEEP", "# KEEP this one"):
+            with self.subTest(variant=variant):
+                permanent = main._classify_batch_lines(["https://a", variant, "https://b"])
+                self.assertEqual(permanent, [False, True, True], f"{variant!r} not recognised")
+
+    def test_an_ordinary_comment_is_not_mistaken_for_the_tag(self):
+        permanent = main._classify_batch_lines(["# currently watching", "https://a"])
+        self.assertEqual(permanent, [False, False])
+
+    def test_a_blank_line_between_the_tag_and_the_url_breaks_the_link(self):
+        """The tag must sit directly above its entry; skip a line and the URL
+        below stays temporary, with the orphaned tag just a comment."""
+        permanent = main._classify_batch_lines(["https://a", self.KEEP, "", "https://b"])
+        self.assertEqual(permanent, [False, False, False, False])
+
+    def test_a_tag_can_open_the_file(self):
+        permanent = main._classify_batch_lines([self.KEEP, "https://a", "https://b"])
+        self.assertEqual(permanent, [True, True, False])
+
+    def test_several_tagged_entries_can_be_scattered_through_the_file(self):
+        permanent = main._classify_batch_lines(
+            ["https://a", self.KEEP, "https://b", "https://c", self.KEEP, "https://d"]
+        )
+        self.assertEqual(permanent, [False, True, True, False, True, True])
+
+    def test_each_mirror_of_the_same_series_needs_its_own_tag(self):
+        permanent = main._classify_batch_lines(
+            [self.KEEP, "https://serienstream.to/serie/x", "https://burningseries.ac/serie/X"]
+        )
+        self.assertEqual(permanent, [True, True, False])
+
+
+class TestSectionAwareWriters(SectionCase):
+    def test_added_urls_land_at_the_end_untagged(self):
+        self.write("https://a", self.KEEP, "https://keepme")
+        main._append_batch_urls(self.path, ["https://new"])
+
+        lines = self.read()
+        self.assertEqual(self.urls(lines), ["https://a", "https://keepme", "https://new"])
+        permanent = main._classify_batch_lines(lines)
+        self.assertFalse(permanent[lines.index("https://new")], "a freshly added URL was tagged permanent")
+
+    def test_adding_to_a_file_with_no_tags_still_just_appends(self):
+        self.write("https://a")
+        main._append_batch_urls(self.path, ["https://new"])
+        self.assertEqual(self.urls(), ["https://a", "https://new"])
+
+    def test_replacing_the_working_list_keeps_tagged_entries(self):
+        self.write("https://old1", "https://old2", self.KEEP, "https://keepme")
+        main._replace_batch_urls(self.path, ["https://fresh"])
+
+        self.assertEqual(self.urls(), ["https://keepme", "https://fresh"])
+        self.assertIn(self.KEEP, self.read())
+
+    def test_replacing_a_file_with_no_tags_replaces_everything(self):
+        self.write("https://old1", "https://old2")
+        main._replace_batch_urls(self.path, ["https://fresh"])
+        self.assertEqual(self.urls(), ["https://fresh"])
+
+    def test_section_counts(self):
+        self.write("https://a", "https://b", "# a note", self.KEEP, "https://keepme")
+        self.assertEqual(main._batch_section_counts(self.path), (2, 1))
+
+    def test_section_counts_with_scattered_tags(self):
+        self.write("https://a", self.KEEP, "https://b", "https://c", self.KEEP, "https://d")
+        self.assertEqual(main._batch_section_counts(self.path), (2, 2))
+
+
+class TestLoadUrlBatchesWithTags(SectionCase):
+    def test_permanent_entries_are_still_loaded_like_any_other(self):
+        """'Permanent' means the file keeps them, not that they are skipped."""
+        self.write(
+            "https://serienstream.to/serie/one",
+            self.KEEP,
+            "https://serienstream.to/serie/two",
+        )
+        grouped, rejected = main.load_url_batches(self.path)
+        self.assertEqual(rejected, [])
+        self.assertEqual(
+            grouped["serienstream.to"],
+            ["https://serienstream.to/serie/one", "https://serienstream.to/serie/two"],
+        )
+
+    def test_the_tag_is_not_reported_as_an_unsupported_line(self):
+        self.write("https://serienstream.to/serie/one", self.KEEP)
+        _grouped, rejected = main.load_url_batches(self.path)
+        self.assertEqual(rejected, [])
+
+
+class TestClearTemporaryUrls(SectionCase, unittest.IsolatedAsyncioTestCase):
+    async def test_it_clears_the_working_list_and_keeps_the_rest(self):
+        self.write("https://a", "https://b", self.KEEP, "https://keepme")
+        with mock.patch.object(main, "ask_yes_no", return_value=True):
+            await main.clear_temporary_urls(self.path)
+        self.assertEqual(self.urls(), ["https://keepme"])
+        self.assertIn(self.KEEP, self.read())
+
+    async def test_saying_no_changes_nothing(self):
+        self.write("https://a", self.KEEP, "https://keepme")
+        before = Path(self.path).read_text(encoding="utf-8")
+        with mock.patch.object(main, "ask_yes_no", return_value=False):
+            await main.clear_temporary_urls(self.path)
+        self.assertEqual(Path(self.path).read_text(encoding="utf-8"), before)
+
+    async def test_it_never_asks_when_there_is_nothing_to_clear(self):
+        self.write(self.KEEP, "https://keepme")
+        with mock.patch.object(main, "ask_yes_no") as ask:
+            await main.clear_temporary_urls(self.path)
+        ask.assert_not_called()
+        self.assertEqual(self.urls(), ["https://keepme"])
+
+    async def test_your_own_comments_in_the_working_list_survive(self):
+        """A tidy-up that also deleted the notes you wrote about the list
+        would be a surprise."""
+        self.write("# currently watching", "https://a", self.KEEP, "https://keepme")
+        with mock.patch.object(main, "ask_yes_no", return_value=True):
+            await main.clear_temporary_urls(self.path)
+        self.assertIn("# currently watching", self.read())
+        self.assertEqual(self.urls(), ["https://keepme"])
+
+    async def test_a_file_with_no_tags_clears_everything_but_warns_first(self):
+        self.write("https://a", "https://b")
+        printed = []
+        with (
+            mock.patch.object(main, "ask_yes_no", return_value=True),
+            mock.patch("builtins.print", side_effect=lambda *a, **k: printed.append(" ".join(str(x) for x in a))),
+        ):
+            await main.clear_temporary_urls(self.path)
+        self.assertTrue(any("tagged permanent" in line for line in printed), "the user was not warned")
+        self.assertEqual(self.urls(), [])
+
+    async def test_the_urls_it_will_remove_are_shown_before_asking(self):
+        self.write("https://a", "https://b", self.KEEP, "https://keepme")
+        printed = []
+        with (
+            mock.patch.object(main, "ask_yes_no", return_value=False),
+            mock.patch("builtins.print", side_effect=lambda *a, **k: printed.append(" ".join(str(x) for x in a))),
+        ):
+            await main.clear_temporary_urls(self.path)
+        body = "\n".join(printed)
+        self.assertIn("https://a", body)
+        self.assertIn("https://b", body)
+        self.assertNotIn("https://keepme", body, "a kept URL was listed as doomed")
+
+    async def test_scattered_tags_are_all_respected(self):
+        self.write("https://a", self.KEEP, "https://b", "https://c", self.KEEP, "https://d")
+        with mock.patch.object(main, "ask_yes_no", return_value=True):
+            await main.clear_temporary_urls(self.path)
+        self.assertEqual(self.urls(), ["https://b", "https://d"])
+
+
+class TestBatchRewritersKeepThePermanentSection(SectionCase, unittest.IsolatedAsyncioTestCase):
+    """Both of these replace the batch file wholesale. Before tagged entries
+    existed that was fine; now a full truncate would delete exactly the
+    entries the user tagged permanent."""
+
+    async def test_retry_replaces_only_the_working_list(self):
+        self.write("https://old", self.KEEP, "https://keepme")
+        with (
+            mock.patch.object(main, "_load_failed_urls", return_value=["https://failed-one"]),
+            mock.patch.object(main, "ask_yes_no", return_value=True),
+        ):
+            await main.retry_failed_urls(self.path)
+
+        self.assertEqual(self.urls(), ["https://keepme", "https://failed-one"])
+        self.assertIn(self.KEEP, self.read())
+
+    async def test_retry_declined_leaves_the_file_alone(self):
+        self.write("https://old", self.KEEP, "https://keepme")
+        before = Path(self.path).read_text(encoding="utf-8")
+        with (
+            mock.patch.object(main, "_load_failed_urls", return_value=["https://failed-one"]),
+            mock.patch.object(main, "ask_yes_no", return_value=False),
+        ):
+            await main.retry_failed_urls(self.path)
+        self.assertEqual(Path(self.path).read_text(encoding="utf-8"), before)
+
+    async def test_retry_with_nothing_recorded_does_not_touch_the_file(self):
+        self.write("https://old", self.KEEP, "https://keepme")
+        before = Path(self.path).read_text(encoding="utf-8")
+        with mock.patch.object(main, "_load_failed_urls", return_value=[]):
+            await main.retry_failed_urls(self.path)
+        self.assertEqual(Path(self.path).read_text(encoding="utf-8"), before)
+
+    async def test_pasting_a_url_replaces_only_the_working_list(self):
+        self.write("https://old", self.KEEP, "https://serienstream.to/serie/keepme")
+        pasted = "https://serienstream.to/serie/fresh"
+        with (
+            mock.patch.object(main, "DEFAULT_BATCH_FILE", self.path),
+            mock.patch("builtins.input", return_value=pasted),
+        ):
+            await main._detect_and_add_input(self.path)
+
+        self.assertEqual(self.urls(), ["https://serienstream.to/serie/keepme", pasted])
+        self.assertIn(self.KEEP, self.read())
+
+    async def test_pasting_an_unsupported_url_changes_nothing(self):
+        self.write("https://old", self.KEEP, "https://keepme")
+        before = Path(self.path).read_text(encoding="utf-8")
+        with (
+            mock.patch.object(main, "DEFAULT_BATCH_FILE", self.path),
+            mock.patch("builtins.input", return_value="https://example.com/not-a-series"),
+        ):
+            await main._detect_and_add_input(self.path)
+        self.assertEqual(Path(self.path).read_text(encoding="utf-8"), before)
+
+    async def test_pressing_enter_cancels_without_touching_the_file(self):
+        self.write("https://old", self.KEEP, "https://keepme")
+        before = Path(self.path).read_text(encoding="utf-8")
+        with (
+            mock.patch.object(main, "DEFAULT_BATCH_FILE", self.path),
+            mock.patch("builtins.input", return_value=""),
+        ):
+            result = await main._detect_and_add_input(self.path)
+        self.assertEqual(result, self.path)
+        self.assertEqual(Path(self.path).read_text(encoding="utf-8"), before)
+
+
+# ==================== failed URLs are per (url, action) ====================
+class FailedStoreCase(unittest.TestCase):
+    """A failure is (url, action), not a url.
+
+    Keying on the URL alone meant a run that successfully marked a series
+    *unwatched* deleted the record that marking the same series *watched*
+    had failed -- a real failure, silently forgotten and never retried.
+    """
+
+    X = "https://serienstream.to/serie/x"
+    Y = "https://serienstream.to/serie/y"
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.store = os.path.join(self.dir.name, "failed.json")
+        patcher = mock.patch.object(main, "FAILED_URLS_FILE", self.store)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def record(self, action, outcomes):
+        report = main.RunReport(total_urls=len(outcomes))
+        report.failed_urls = [u for u, ok in outcomes.items() if not ok]
+        report.failed = len(report.failed_urls)
+        report.successful = len(outcomes) - report.failed
+        main._persist_failed_urls(report, set(outcomes), action)
+
+    def stored(self):
+        return {(e["url"], e["action"]) for e in main._load_failed_entries()}
+
+    def write_raw(self, payload):
+        Path(self.store).write_text(json.dumps(payload), encoding="utf-8")
+
+
+class TestFailedStore(FailedStoreCase):
+    def test_a_failure_records_the_action_it_happened_under(self):
+        self.record(ACTION_WATCHED, {self.X: False})
+        self.assertEqual(self.stored(), {(self.X, ACTION_WATCHED)})
+
+    def test_a_success_under_the_other_action_does_not_clear_it(self):
+        self.record(ACTION_WATCHED, {self.X: False})
+        self.record(ACTION_UNWATCHED, {self.X: True})
+        self.assertEqual(
+            self.stored(),
+            {(self.X, ACTION_WATCHED)},
+            "marking it unwatched erased the record that marking it watched had failed",
+        )
+
+    def test_a_success_under_the_same_action_does_clear_it(self):
+        self.record(ACTION_WATCHED, {self.X: False})
+        self.record(ACTION_WATCHED, {self.X: True})
+        self.assertEqual(self.stored(), set())
+
+    def test_failing_under_both_actions_keeps_both(self):
+        self.record(ACTION_WATCHED, {self.X: False})
+        self.record(ACTION_UNWATCHED, {self.X: False})
+        self.assertEqual(self.stored(), {(self.X, ACTION_WATCHED), (self.X, ACTION_UNWATCHED)})
+
+    def test_failing_twice_under_one_action_is_still_one_entry(self):
+        self.record(ACTION_WATCHED, {self.X: False})
+        self.record(ACTION_WATCHED, {self.X: False})
+        self.assertEqual(self.stored(), {(self.X, ACTION_WATCHED)})
+
+    def test_a_url_this_run_never_attempted_is_left_alone(self):
+        self.record(ACTION_WATCHED, {self.X: False, self.Y: False})
+        self.record(ACTION_WATCHED, {self.X: True})
+        self.assertEqual(self.stored(), {(self.Y, ACTION_WATCHED)})
+
+    def test_the_batch_written_for_retry_lists_a_url_once(self):
+        """Two actions failing is two records but one line to re-run."""
+        self.record(ACTION_WATCHED, {self.X: False})
+        self.record(ACTION_UNWATCHED, {self.X: False})
+        self.assertEqual(main._load_failed_urls(), [self.X])
+
+
+class TestLegacyFailedFile(FailedStoreCase):
+    """Files written before the action was recorded hold bare URL strings."""
+
+    def test_bare_strings_are_read_with_an_unknown_action(self):
+        self.write_raw([self.X, self.Y])
+        self.assertEqual(self.stored(), {(self.X, ""), (self.Y, "")})
+
+    def test_an_unknown_entry_is_cleared_by_whichever_action_succeeds(self):
+        """Exactly how it behaved before, so upgrading loses nothing."""
+        self.write_raw([self.X])
+        self.record(ACTION_UNWATCHED, {self.X: True})
+        self.assertEqual(self.stored(), set())
+
+    def test_an_unknown_entry_that_fails_again_gains_its_action(self):
+        self.write_raw([self.X])
+        self.record(ACTION_WATCHED, {self.X: False})
+        self.assertEqual(self.stored(), {(self.X, ACTION_WATCHED)})
+
+    def test_a_mixed_file_of_old_and_new_entries_reads_cleanly(self):
+        self.write_raw([self.X, {"url": self.Y, "action": ACTION_WATCHED}])
+        self.assertEqual(self.stored(), {(self.X, ""), (self.Y, ACTION_WATCHED)})
+
+    def test_junk_entries_are_skipped_rather_than_crashing(self):
+        self.write_raw([self.X, None, 42, {}, {"action": "watched"}])
+        self.assertEqual(self.stored(), {(self.X, "")})
+
+    def test_a_corrupt_file_is_reported_as_empty(self):
+        Path(self.store).write_text("{ not json", encoding="utf-8")
+        self.assertEqual(main._load_failed_entries(), [])
+
+    def test_a_json_object_instead_of_a_list_is_reported_as_empty(self):
+        self.write_raw({"urls": [self.X]})
+        self.assertEqual(main._load_failed_entries(), [])
+
+
+class TestRetryShowsTheAction(FailedStoreCase, unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        super().setUp()
+        self.batch = os.path.join(self.dir.name, "series_urls.txt")
+        Path(self.batch).write_text("", encoding="utf-8")
+
+    async def _retry_output(self):
+        printed = []
+        with (
+            mock.patch.object(main, "ask_yes_no", return_value=False),
+            mock.patch("builtins.print", side_effect=lambda *a, **k: printed.append(" ".join(str(x) for x in a))),
+        ):
+            await main.retry_failed_urls(self.batch)
+        return "\n".join(printed)
+
+    async def test_it_names_the_action_and_the_option_to_use(self):
+        self.record(ACTION_WATCHED, {self.X: False})
+        body = await self._retry_output()
+        self.assertIn("WATCHED", body)
+        self.assertIn("option 1", body)
+
+    async def test_unwatched_failures_point_at_option_2(self):
+        self.record(ACTION_UNWATCHED, {self.X: False})
+        body = await self._retry_output()
+        self.assertIn("UNWATCHED", body)
+        self.assertIn("option 2", body)
+
+    async def test_a_mixed_list_warns_that_both_options_are_needed(self):
+        self.record(ACTION_WATCHED, {self.X: False})
+        self.record(ACTION_UNWATCHED, {self.Y: False})
+        body = await self._retry_output()
+        self.assertIn("different actions", body)
 
 if __name__ == "__main__":
     unittest.main()

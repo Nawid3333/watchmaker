@@ -1319,26 +1319,46 @@ async def process_batch(
     report = RunReport(total_urls=sum(len(p) for p in plans_by_host.values()) + len(presets))
 
     hosts = list(plans_by_host)
+    host_w = max((len(h) for h in hosts), default=0)
+
+    async def mark_host(host: str, worker: DomainWorker) -> list[SeriesResult]:
+        """Every series for one host, strictly one at a time, in order."""
+        plans = plans_by_host[host]
+        logger.info("Processing %s (%d URLs)", host, len(plans))
+        marked: list[SeriesResult] = []
+        num_w = len(str(len(plans)))
+        for idx, plan in enumerate(plans, 1):
+            label = plan.title or plan.slug
+            result = await worker.mark_series(plan, action)
+            marked.append(result)
+            # One print per completion, carrying its own host name. The old
+            # two-step "label ... " then result printed a line in two halves,
+            # which another host finishing in between would split down the
+            # middle now that the hosts run together.
+            print(f"    {host:<{host_w}}  [{idx:>{num_w}}/{len(plans)}] {label} ... {result.line()}")
+        return marked
+
     async with contextlib.AsyncExitStack() as stack:
         workers = [await stack.enter_async_context(DomainWorker(host)) for host in hosts]
         # Same reason as in _preview: the logins are independent servers and
-        # were the whole pause between one host's block and the next. The
-        # marking itself stays strictly sequential, one series at a time, so
-        # nothing about what gets written changes.
+        # were the whole pause between one host's block and the next.
         await asyncio.gather(*(worker.login() for worker in workers))
 
-        for host, worker in zip(hosts, workers, strict=True):
-            plans = plans_by_host[host]
-            print(f"\n  → {host}: {len(plans)} series")
-            logger.info("Processing %s (%d URLs)", host, len(plans))
+        for host in hosts:
+            print(f"\n  → {host}: {len(plans_by_host[host])} series")
+        print()
 
-            num_w = len(str(len(plans)))
-            for idx, plan in enumerate(plans, 1):
-                label = plan.title or plan.slug
-                print(f"    [{idx:>{num_w}}/{len(plans)}] {label} ...", end=" ", flush=True)
-                result = await worker.mark_series(plan, action)
-                results.append(result)
-                print(result.line())
+        # Hosts run together; each one's own series stay sequential. Different
+        # servers, different workers, different sessions -- no site sees more
+        # than one request at a time from this run.
+        per_host = await asyncio.gather(
+            *(mark_host(host, worker) for host, worker in zip(hosts, workers, strict=True))
+        )
+
+    # Merged in host order, not completion order, so the report and the
+    # failed-URL file do not depend on which host happened to finish first.
+    for marked in per_host:
+        results.extend(marked)
 
     for result in results:
         if result.ok and result.at_target:
@@ -1347,11 +1367,11 @@ async def process_batch(
             report.failed += 1
             report.failed_urls.append(result.url)
 
-    _persist_failed_urls(report, {r.url for r in results})
+    _persist_failed_urls(report, {r.url for r in results}, action)
     return report, results
 
 
-def _persist_failed_urls(report: RunReport, attempted_urls: set[str]) -> None:
+def _persist_failed_urls(report: RunReport, attempted_urls: set[str], action: str) -> None:
     """Reconcile this run's failures into the shared failed-urls file.
 
     IMPORTANT: this must never simply overwrite FAILED_URLS_FILE with
@@ -1362,13 +1382,34 @@ def _persist_failed_urls(report: RunReport, attempted_urls: set[str]) -> None:
     out unrelated failures recorded by an earlier, differently-scoped run
     that the user hasn't retried yet.
 
-    Instead, only reconcile the URLs actually attempted in this run: a URL
-    that succeeded is cleared, a URL that failed is (re)recorded, and any
-    URL already on disk that this run never touched is left exactly as-is.
+    A failure is (url, action), not a url. Keying on the URL alone meant a
+    run that successfully marked a series *unwatched* deleted the record
+    that marking the same series *watched* had failed -- a real failure,
+    silently forgotten and never retried. Only entries for the action this
+    run actually performed are resolved by it; a failure recorded for the
+    other action is left standing, because this run says nothing about it.
+
+    An entry with no action recorded is from an older file and is resolved
+    by whichever action attempts it next, exactly as it behaved before.
     """
-    existing = set(_load_failed_urls())
-    failed_this_run = {u for u in report.failed_urls if u}
-    reconciled = sorted((existing - attempted_urls) | failed_this_run)
+    existing = _load_failed_entries()
+    failed_now = {url for url in report.failed_urls if url}
+
+    kept: list[dict] = []
+    for entry in existing:
+        recorded = entry["action"]
+        if entry["url"] not in attempted_urls:
+            kept.append(entry)  # different scope entirely
+        elif recorded and recorded != action:
+            kept.append(entry)  # the other action's failure still stands
+        # else: this run is the authority on it, and re-adds it below if it
+        # failed again.
+
+    already = {(e["url"], e["action"]) for e in kept}
+    reconciled = kept + [
+        {"url": url, "action": action} for url in sorted(failed_now) if (url, action) not in already
+    ]
+    reconciled.sort(key=lambda e: (e["url"], e["action"]))
 
     Path(FAILED_URLS_FILE).parent.mkdir(parents=True, exist_ok=True)
     _atomic_write(FAILED_URLS_FILE, json.dumps(reconciled, indent=2, ensure_ascii=False))
@@ -1430,6 +1471,78 @@ def _append_lines(path: str, lines: list[str]) -> None:
             f.write(line + "\n")
 
 
+# ==================== BATCH FILE SECTIONS ====================
+# Any URL line is permanent when the line directly above it -- no blank line
+# in between -- is this tag; every other URL line is temporary, which option
+# 7 clears. Permanent entries can live anywhere in the file, next to whatever
+# they're related to, instead of being forced into one block.
+#
+# The tag is a comment, so every existing reader -- load_url_batches,
+# _batch_has_urls, _rewrite_batch_urls -- already ignores it and keeps
+# working unchanged on a file that has one.
+PERMANENT_TAG = "# KEEP"
+
+# Deliberately forgiving about spacing, because this line exists to be
+# hand-edited. Anything that reads as a KEEP comment counts.
+_PERMANENT_TAG_RE = re.compile(r"^\s*#\s*KEEP\b", re.IGNORECASE)
+
+
+def _is_entry_line(line: str) -> bool:
+    """A non-blank, non-comment line: a URL, or at least meant to be one."""
+    stripped = line.strip()
+    return bool(stripped) and not stripped.startswith("#")
+
+
+def _classify_batch_lines(lines: list[str]) -> list[bool]:
+    """True at index i when lines[i] is a permanent entry, or its tag.
+
+    A file with no tags classifies every entry as temporary, which is what
+    every batch file written before this feature was.
+    """
+    permanent = [False] * len(lines)
+    for i, line in enumerate(lines):
+        if _is_entry_line(line) and i > 0 and _PERMANENT_TAG_RE.match(lines[i - 1]):
+            permanent[i] = True
+            permanent[i - 1] = True  # the tag travels with the entry it marks
+    return permanent
+
+
+def _append_batch_urls(path: str, urls: list[str]) -> None:
+    """Add URLs to the end of the file, untagged -- so they're temporary.
+
+    A newly added series was never marked permanent, so it belongs in the
+    working list regardless of what else is already in the file.
+    """
+    _append_lines(path, urls)
+
+
+def _replace_batch_urls(path: str, urls: list[str]) -> None:
+    """Replace the temporary entries, leaving permanent ones untouched.
+
+    Both callers used to truncate the whole file. That would delete
+    precisely the entries the user tagged permanent, which this feature
+    exists to prevent.
+    """
+    lines = _read_lines(path)
+    permanent = _classify_batch_lines(lines)
+    body = [line for i, line in enumerate(lines) if not _is_entry_line(line) or permanent[i]]
+    while body and not body[-1].strip():
+        body.pop()
+    if urls:
+        if body:
+            body.append("")
+        body.extend(urls)
+    _atomic_write(path, "".join(line + "\n" for line in body))
+
+
+def _batch_section_counts(path: str) -> tuple[int, int]:
+    """(temporary URLs, permanent URLs) currently in the batch file."""
+    lines = _read_lines(path)
+    permanent = _classify_batch_lines(lines)
+    entries = [permanent[i] for i, line in enumerate(lines) if _is_entry_line(line)]
+    return entries.count(False), entries.count(True)
+
+
 def _rewrite_batch_urls(path: str, mapping: dict[str, str]) -> bool:
     """Swap migrated URLs in place, keeping comments and unknown lines.
 
@@ -1451,17 +1564,45 @@ def _rewrite_batch_urls(path: str, mapping: dict[str, str]) -> bool:
     return changed
 
 
-def _load_failed_urls() -> list[str]:
+def _load_failed_entries() -> list[dict]:
+    """Recorded failures as {"url", "action"} pairs.
+
+    Older files stored bare URL strings with no action. Those are read back
+    with an empty action meaning "unknown", and the next run that attempts
+    that URL under any action resolves them -- which is exactly how they
+    behaved before, so upgrading loses nothing.
+    """
     if not os.path.exists(FAILED_URLS_FILE):
         return []
     try:
         with open(FAILED_URLS_FILE, encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, list):
-            return [str(u) for u in data if u]
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not read failed URLs: %s", exc)
-    return []
+        return []
+    if not isinstance(data, list):
+        return []
+
+    entries: list[dict] = []
+    for item in data:
+        if isinstance(item, str) and item:
+            entries.append({"url": item, "action": ""})
+        elif isinstance(item, dict) and item.get("url"):
+            entries.append({"url": str(item["url"]), "action": str(item.get("action") or "")})
+    return entries
+
+
+def _load_failed_urls() -> list[str]:
+    """Just the URLs, in order, without repeats.
+
+    A URL that failed under both actions is two entries but one line in the
+    batch file, so the caller writing that file wants it once.
+    """
+    seen: list[str] = []
+    for entry in _load_failed_entries():
+        if entry["url"] not in seen:
+            seen.append(entry["url"])
+    return seen
 
 
 def _batch_has_urls(urls_file: str) -> bool:
@@ -1533,6 +1674,9 @@ def print_menu(
 ) -> None:
     active_hosts = set((active_host_by_family or {}).values())
     print(f"\n  batch file: {urls_file}")
+    temporary_count, permanent_count = _batch_section_counts(urls_file)
+    if temporary_count or permanent_count:
+        print(f"    {temporary_count} temporary, {permanent_count} permanent")
     if not _batch_has_urls(urls_file):
         print("  default batch file is empty.")
         print("  use option 5 to add a URL or switch batch files.")
@@ -1550,14 +1694,15 @@ def print_menu(
         print("    (no supported URLs)")
 
     if has_failed:
-        print("\n  failed URLs available for retry")
+        print("\n  failed URLs available for retry (option 6)")
     print("\n  options:")
     print("    1  mark as WATCHED")
     print("    2  mark as UNWATCHED")
     print("    3  export URLs to scraper lists")
-    print("    4  retry failed URLs")
+    print("    4  import URLs from scraper lists")
     print("    5  add link / change batch")
-    print("    6  import URLs from scraper lists")
+    print("    6  retry failed URLs")
+    print("    7  clear temporary entries")
     print("    0  exit")
 
 
@@ -1642,6 +1787,14 @@ def _failed_result(host: str, family: str, url: str, action: str, note: str) -> 
     return SeriesResult(host, family, url, slug, action=action, ok=False, note=note)
 
 
+def _print_section(title: str, count: int) -> None:
+    """A titled, ruled block so groups are separated by more than a blank line."""
+    rule = "─" * min(56, max(24, _term_width() - 4))
+    print(f"\n  {rule}")
+    print(f"  {title}  ({count})")
+    print(f"  {rule}")
+
+
 async def _preview(
     action: str,
     grouped: dict[str, list[str]],
@@ -1655,6 +1808,12 @@ async def _preview(
     todo: list[tuple[SeriesResult, SeriesPlan]] = []
     done: list[SeriesResult] = []
     broken: list[SeriesResult] = []
+    todo_lines: list[str] = []
+    done_lines: list[str] = []
+
+    total = sum(len(urls) for urls in grouped.values())
+    width = len(str(total))
+    scanned = 0
 
     hosts = sorted(grouped)
     async with contextlib.AsyncExitStack() as stack:
@@ -1694,19 +1853,41 @@ async def _preview(
                 counter = f"{result.watched_before}/{result.total_episodes}"
                 if needs_episodes:
                     counter += f" → {result.watched_episodes}/{result.total_episodes}"
-                print(
-                    f"  {host}: {result.title or result.slug}{result.status_extra}{sub_badge} "
+                headline = (
+                    f"    {host}: {result.title or result.slug}{result.status_extra}{sub_badge} "
                     f"{result.season_summary} — {counter}"
                 )
-                for line in result.detail_lines():
-                    print(f"      {line}")
-                if unreadable:
-                    print("      ⚠ some seasons list no episodes — will be reported as failed")
+
+                scanned += 1
+                # Live progress, one short line, so a long batch does not sit
+                # silent while it is read.
+                print(f"    [{scanned:>{width}}/{total}] {host}  {result.title or result.slug}")
 
                 if needs_episodes or needs_sub or unreadable:
                     todo.append((result, plan))
+                    block = [headline]
+                    block += [f"        {line}" for line in result.detail_lines()]
+                    if unreadable:
+                        block.append("        ⚠ some seasons list no episodes — will be reported as failed")
+                    todo_lines.extend(block)
                 else:
                     done.append(result)
+                    # Nothing is changing here, so the per-season breakdown
+                    # would be noise; the counter already says it is complete.
+                    done_lines.append(headline)
+
+    if todo_lines:
+        _print_section("WILL CHANGE", len(todo))
+        for line in todo_lines:
+            print(line)
+    if done_lines:
+        _print_section("ALREADY AT TARGET", len(done))
+        for line in done_lines:
+            print(line)
+    if broken:
+        _print_section("COULD NOT READ", len(broken))
+        for result in broken:
+            print(f"    {result.host}: {result.url}  ({result.note or 'unreadable'})")
 
     return todo, done, broken
 
@@ -1737,7 +1918,7 @@ async def run_action(action: str, grouped: dict[str, list[str]], rejected: list[
             report.successful = len(done)
             report.failed_urls = [r.url for r in broken]
             report.rejected = rejected
-            _persist_failed_urls(report, {r.url for r in results})
+            _persist_failed_urls(report, {r.url for r in results}, action)
             _print_run_summary(report, results)
         else:
             print(f"\n  → nothing to do; all {len(done)} series already at target state ({action}).")
@@ -1873,29 +2054,86 @@ async def import_urls(urls_file: str) -> None:
         print("\n  no new URLs to import (all already in batch).")
         return
 
-    _append_lines(urls_file, new_urls)
+    _append_batch_urls(urls_file, new_urls)
     print(f"\n  appended {len(new_urls)} new URL(s) → {urls_file}")
     for family, count in sorted(added_by_family.items()):
         print(f"    {family}: {count}")
     logger.info("Imported %d URL(s) from scraper lists into %s", len(new_urls), urls_file)
 
 
+async def clear_temporary_urls(urls_file: str) -> None:
+    """Option 7: empty the working list, leave permanent entries alone.
+
+    Only untagged URL lines are removed. Comments and blank lines are the
+    user's own notes about their list, and a tidy-up that silently deleted
+    those as well would be a surprise.
+    """
+    lines = _read_lines(urls_file)
+    permanent = _classify_batch_lines(lines)
+    doomed = [line.strip() for i, line in enumerate(lines) if _is_entry_line(line) and not permanent[i]]
+    kept = [line.strip() for i, line in enumerate(lines) if _is_entry_line(line) and permanent[i]]
+
+    print("\n  clear temporary entries")
+    print(f"  file: {urls_file}")
+
+    if not kept:
+        print("\n  ⚠ no entries are tagged permanent, so everything in this file counts as temporary.")
+        print("    to protect an entry from this option, add this line directly above it:")
+        print(f"      {PERMANENT_TAG}")
+
+    if not doomed:
+        print("\n  nothing to clear — the working list is already empty.")
+        return
+
+    print(f"\n  {len(doomed)} URL(s) will be removed:")
+    for url in doomed[:15]:
+        print(f"      {url}")
+    if len(doomed) > 15:
+        print(f"      ... and {len(doomed) - 15} more")
+    print(f"\n  {len(kept)} permanent entrie(s) will be kept.")
+
+    if not ask_yes_no("\n  remove them?", default=False):
+        print("  cancelled.")
+        return
+
+    remaining = [line for i, line in enumerate(lines) if not _is_entry_line(line) or permanent[i]]
+    _atomic_write(urls_file, "".join(line + "\n" for line in remaining))
+    print(f"  removed {len(doomed)} URL(s) → {urls_file}")
+    logger.info("Cleared %d temporary URL(s) from %s", len(doomed), urls_file)
+
+
 async def retry_failed_urls(urls_file: str) -> str:
     """Replace the batch file with the recorded failed URLs."""
+    entries = _load_failed_entries()
     failed = _load_failed_urls()
     if not failed:
         print("\n  no failed URLs to retry.")
         return urls_file
 
+    # Grouped by the action they failed under, because retrying is only
+    # useful if you know which of options 1 and 2 to run afterwards.
+    by_action: dict[str, list[str]] = {}
+    for entry in entries:
+        by_action.setdefault(entry["action"], []).append(entry["url"])
+
     print(f"\n  → {len(failed)} failed URL(s) loaded")
-    for idx, url in enumerate(failed, 1):
-        print(f"    {idx}. {url}")
+    labels = {
+        ACTION_WATCHED: "failed while marking WATCHED — retry with option 1",
+        ACTION_UNWATCHED: "failed while marking UNWATCHED — retry with option 2",
+        "": "recorded before actions were tracked — use option 1 or 2",
+    }
+    for act in sorted(by_action, key=lambda a: (a == "", a)):
+        print(f"\n    {labels.get(act, act)}:")
+        for url in by_action[act]:
+            print(f"      {url}")
+    if len(by_action) > 1:
+        print("\n    ⚠ these came from different actions; run each option in turn.")
 
     if not ask_yes_no("\n  replace current batch with these failed URLs?"):
         print("  retry cancelled.")
         return urls_file
 
-    _atomic_write(urls_file, "".join(url + "\n" for url in failed))
+    _replace_batch_urls(urls_file, failed)
     print(f"  wrote {len(failed)} failed URL(s) → {urls_file}")
     logger.info("Wrote %d failed URL(s) to %s", len(failed), urls_file)
     return urls_file
@@ -1925,7 +2163,9 @@ async def _detect_and_add_input(urls_file: str) -> str:
         ):
             print("  cancelled.")
             return urls_file
-        _atomic_write(DEFAULT_BATCH_FILE, user_input + "\n")
+        # Replaces the working list only. This used to truncate the whole
+        # file, which would take permanent entries with it.
+        _replace_batch_urls(DEFAULT_BATCH_FILE, [user_input])
         print(f"  wrote 1 URL → {DEFAULT_BATCH_FILE}")
         return DEFAULT_BATCH_FILE
 
@@ -1984,13 +2224,16 @@ async def main() -> None:
         elif choice == "3":
             await export_urls(urls_file)
         elif choice == "4":
-            urls_file = await retry_failed_urls(urls_file)
+            await import_urls(urls_file)
             await refresh()
         elif choice == "5":
             urls_file = await _detect_and_add_input(urls_file)
             await refresh()
         elif choice == "6":
-            await import_urls(urls_file)
+            urls_file = await retry_failed_urls(urls_file)
+            await refresh()
+        elif choice == "7":
+            await clear_temporary_urls(urls_file)
             await refresh()
         else:
             print("  invalid option.")
