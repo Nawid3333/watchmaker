@@ -88,7 +88,7 @@ DEFAULT_BATCH_FILE_PATH = "series_urls.txt"
 # ==================== EXPORT TO SCRAPER LISTS ====================
 # Map each site family to an external series_urls.txt file.
 # These are the targets for menu option 3 (export) and the sources for
-# option 6 (import); exporting is manual, never automatic after a run.
+# option 4 (import); exporting is manual, never automatic after a run.
 # Set a value to None to disable exporting for that family.
 # Relative paths are resolved against PROJECT_ROOT.
 #

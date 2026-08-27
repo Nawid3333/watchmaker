@@ -346,6 +346,8 @@ def load_url_batches(source: str) -> tuple[dict[str, list[str]], list[dict]]:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
+        if line.startswith(PERMANENT_PREFIX):
+            line = line[len(PERMANENT_PREFIX):].strip()
         if not line.startswith(("http://", "https://")):
             rejected.append({"line": line, "reason": "missing http(s)://"})
             continue
@@ -1472,19 +1474,20 @@ def _append_lines(path: str, lines: list[str]) -> None:
 
 
 # ==================== BATCH FILE SECTIONS ====================
-# Any URL line is permanent when the line directly above it -- no blank line
-# in between -- is this tag; every other URL line is temporary, which option
-# 7 clears. Permanent entries can live anywhere in the file, next to whatever
-# they're related to, instead of being forced into one block.
-#
-# The tag is a comment, so every existing reader -- load_url_batches,
-# _batch_has_urls, _rewrite_batch_urls -- already ignores it and keeps
-# working unchanged on a file that has one.
-PERMANENT_TAG = "# KEEP"
+# Two ways for a URL to be permanent, usable together:
+#   1. A block: everything from the KEEP marker line down.
+#   2. A single line: a '-' directly before that one URL, wherever it is.
+# Both are comments (or comment-like prefixes) that every existing reader --
+# load_url_batches, _batch_has_urls, _rewrite_batch_urls -- already strips
+# or ignores, so a file using either keeps working unchanged.
+KEEP_MARKER = "# ===== KEEP BELOW (never cleared by option 7) ====="
 
-# Deliberately forgiving about spacing, because this line exists to be
-# hand-edited. Anything that reads as a KEEP comment counts.
-_PERMANENT_TAG_RE = re.compile(r"^\s*#\s*KEEP\b", re.IGNORECASE)
+# Deliberately forgiving about spacing and the number of '=' signs, because
+# this line exists to be hand-edited. Anything that reads as a KEEP comment
+# counts.
+_KEEP_MARKER_RE = re.compile(r"^\s*#\s*=*\s*KEEP\b", re.IGNORECASE)
+
+PERMANENT_PREFIX = "-"
 
 
 def _is_entry_line(line: str) -> bool:
@@ -1493,46 +1496,81 @@ def _is_entry_line(line: str) -> bool:
     return bool(stripped) and not stripped.startswith("#")
 
 
-def _classify_batch_lines(lines: list[str]) -> list[bool]:
-    """True at index i when lines[i] is a permanent entry, or its tag.
+def _is_individually_tagged(line: str) -> bool:
+    return line.strip().startswith(PERMANENT_PREFIX)
 
-    A file with no tags classifies every entry as temporary, which is what
+
+def _classify_batch_lines(lines: list[str]) -> list[bool]:
+    """True at index i when lines[i] is permanent: on or below the KEEP
+    marker, or individually tagged with a leading '-'.
+
+    A file using neither classifies every entry as temporary, which is what
     every batch file written before this feature was.
     """
     permanent = [False] * len(lines)
+    in_keep_section = False
     for i, line in enumerate(lines):
-        if _is_entry_line(line) and i > 0 and _PERMANENT_TAG_RE.match(lines[i - 1]):
+        if _KEEP_MARKER_RE.match(line):
+            in_keep_section = True
+        if in_keep_section or (_is_entry_line(line) and _is_individually_tagged(line)):
             permanent[i] = True
-            permanent[i - 1] = True  # the tag travels with the entry it marks
     return permanent
 
 
-def _append_batch_urls(path: str, urls: list[str]) -> None:
-    """Add URLs to the end of the file, untagged -- so they're temporary.
+def _split_batch_sections(lines: list[str]) -> tuple[list[str], list[str]]:
+    """Split batch lines into (temporary, keep) at the first KEEP marker.
 
-    A newly added series was never marked permanent, so it belongs in the
-    working list regardless of what else is already in the file.
+    The marker line travels with the keep section so writers can rebuild the
+    file as temporary + keep without having to remember it separately. A
+    line individually tagged with '-' can still be in the temporary half of
+    this split; callers that care about that use _classify_batch_lines.
     """
-    _append_lines(path, urls)
+    for index, line in enumerate(lines):
+        if _KEEP_MARKER_RE.match(line):
+            return lines[:index], lines[index:]
+    return list(lines), []
+
+
+def _write_batch_sections(path: str, temporary: list[str], keep: list[str]) -> None:
+    """Write both sections back, with one blank line between them."""
+    body = list(temporary)
+    while body and not body[-1].strip():
+        body.pop()
+    if keep:
+        if body:
+            body.append("")
+        body.extend(keep)
+    _atomic_write(path, "".join(line + "\n" for line in body))
+
+
+def _append_batch_urls(path: str, urls: list[str]) -> None:
+    """Add URLs to the working list, above the keep marker.
+
+    Appending to the end of the file would drop them below the marker and
+    quietly make them permanent -- the opposite of what adding a series to
+    the working list means.
+    """
+    if not urls:
+        return
+    temporary, keep = _split_batch_sections(_read_lines(path))
+    if not keep:
+        # No marker: plain append, exactly as before.
+        _append_lines(path, urls)
+        return
+    _write_batch_sections(path, temporary + urls, keep)
 
 
 def _replace_batch_urls(path: str, urls: list[str]) -> None:
     """Replace the temporary entries, leaving permanent ones untouched.
 
-    Both callers used to truncate the whole file. That would delete
-    precisely the entries the user tagged permanent, which this feature
-    exists to prevent.
+    Both callers used to truncate the whole file. That would delete the
+    keep block, and would also delete any individually '-'-tagged line that
+    happened to be above the marker, which this feature exists to prevent.
     """
     lines = _read_lines(path)
-    permanent = _classify_batch_lines(lines)
-    body = [line for i, line in enumerate(lines) if not _is_entry_line(line) or permanent[i]]
-    while body and not body[-1].strip():
-        body.pop()
-    if urls:
-        if body:
-            body.append("")
-        body.extend(urls)
-    _atomic_write(path, "".join(line + "\n" for line in body))
+    temporary, keep = _split_batch_sections(lines)
+    survivors = [line for line in temporary if not _is_entry_line(line) or _is_individually_tagged(line)]
+    _write_batch_sections(path, list(urls) + survivors, keep)
 
 
 def _batch_section_counts(path: str) -> tuple[int, int]:
@@ -1547,15 +1585,20 @@ def _rewrite_batch_urls(path: str, mapping: dict[str, str]) -> bool:
     """Swap migrated URLs in place, keeping comments and unknown lines.
 
     Rebuilding the file from the parsed batch would silently delete every
-    comment, blank line and unsupported entry the user had in there.
+    comment, blank line and unsupported entry the user had in there. A
+    '-'-tagged line is matched on the URL after the tag and rewritten with
+    the tag put back, so a migrated series does not silently lose it.
     """
     lines = _read_lines(path)
     changed = False
     out: list[str] = []
     for line in lines:
-        new = mapping.get(line.strip())
-        if new and new != line.strip():
-            out.append(new)
+        stripped = line.strip()
+        tagged = stripped.startswith(PERMANENT_PREFIX)
+        key = stripped[len(PERMANENT_PREFIX):].strip() if tagged else stripped
+        new = mapping.get(key)
+        if new and new != key:
+            out.append(PERMANENT_PREFIX + new if tagged else new)
             changed = True
         else:
             out.append(line)
@@ -2077,9 +2120,11 @@ async def clear_temporary_urls(urls_file: str) -> None:
     print(f"  file: {urls_file}")
 
     if not kept:
-        print("\n  ⚠ no entries are tagged permanent, so everything in this file counts as temporary.")
-        print("    to protect an entry from this option, add this line directly above it:")
-        print(f"      {PERMANENT_TAG}")
+        print("\n  ⚠ nothing is protected, so everything in this file counts as temporary.")
+        print("    to protect a group of entries, add this line above them:")
+        print(f"      {KEEP_MARKER}")
+        print(f"    or protect a single entry by putting '{PERMANENT_PREFIX}' directly before its URL:")
+        print(f"      {PERMANENT_PREFIX}https://example.com/serie/some-show")
 
     if not doomed:
         print("\n  nothing to clear — the working list is already empty.")

@@ -1107,10 +1107,10 @@ class TestBatchIsParsedOnce(unittest.IsolatedAsyncioTestCase):
 
 # ==================== batch file sections / option 7 ====================
 class SectionCase(unittest.TestCase):
-    """A URL line directly under a `# KEEP` tag (no blank line between) is
-    permanent; every other URL line is temporary."""
+    """A URL is permanent when it is on or below the KEEP marker, or when
+    it is individually tagged with a leading '-' of its own."""
 
-    KEEP = "# KEEP"
+    KEEP = "# ===== KEEP BELOW (never cleared by option 7) ====="
 
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
@@ -1129,72 +1129,79 @@ class SectionCase(unittest.TestCase):
 
 
 class TestClassifyBatchLines(SectionCase):
-    def test_a_file_without_a_tag_is_entirely_temporary(self):
-        """Every batch file written before this feature has no tag."""
+    def test_a_file_using_neither_mechanism_is_entirely_temporary(self):
+        """Every batch file written before this feature has neither."""
         permanent = main._classify_batch_lines(["https://a", "https://b"])
         self.assertEqual(permanent, [False, False])
 
-    def test_a_tag_marks_only_the_line_directly_below_it(self):
-        permanent = main._classify_batch_lines(["https://a", self.KEEP, "https://b"])
-        self.assertEqual(permanent, [False, True, True])
+    def test_the_marker_starts_the_keep_section_and_everything_below_is_permanent(self):
+        permanent = main._classify_batch_lines(["https://a", self.KEEP, "https://b", "https://c"])
+        self.assertEqual(permanent, [False, True, True, True])
 
-    def test_the_tag_is_recognised_however_it_was_hand_edited(self):
-        """It exists to be edited by hand, so spacing and case must not matter."""
-        for variant in ("# KEEP", "#keep", "#  KEEP", "   # KEEP", "# KEEP this one"):
+    def test_the_marker_is_recognised_however_it_was_hand_edited(self):
+        """It exists to be edited by hand, so spacing, case and the number of
+        '=' signs must not matter."""
+        for variant in ("# KEEP", "#keep", "#  ==== Keep below ====", "   # ===== KEEP =====", "# KEEP my stuff"):
             with self.subTest(variant=variant):
                 permanent = main._classify_batch_lines(["https://a", variant, "https://b"])
                 self.assertEqual(permanent, [False, True, True], f"{variant!r} not recognised")
 
-    def test_an_ordinary_comment_is_not_mistaken_for_the_tag(self):
+    def test_an_ordinary_comment_is_not_mistaken_for_the_marker(self):
         permanent = main._classify_batch_lines(["# currently watching", "https://a"])
         self.assertEqual(permanent, [False, False])
 
-    def test_a_blank_line_between_the_tag_and_the_url_breaks_the_link(self):
-        """The tag must sit directly above its entry; skip a line and the URL
-        below stays temporary, with the orphaned tag just a comment."""
-        permanent = main._classify_batch_lines(["https://a", self.KEEP, "", "https://b"])
-        self.assertEqual(permanent, [False, False, False, False])
+    def test_a_dash_tags_a_single_url_wherever_it_is(self):
+        permanent = main._classify_batch_lines(["https://a", "-https://b", "https://c"])
+        self.assertEqual(permanent, [False, True, False])
 
-    def test_a_tag_can_open_the_file(self):
-        permanent = main._classify_batch_lines([self.KEEP, "https://a", "https://b"])
-        self.assertEqual(permanent, [True, True, False])
+    def test_a_dash_tagged_url_above_the_marker_is_still_permanent(self):
+        permanent = main._classify_batch_lines(["-https://a", "https://b", self.KEEP, "https://c"])
+        self.assertEqual(permanent, [True, False, True, True])
 
-    def test_several_tagged_entries_can_be_scattered_through_the_file(self):
-        permanent = main._classify_batch_lines(
-            ["https://a", self.KEEP, "https://b", "https://c", self.KEEP, "https://d"]
-        )
-        self.assertEqual(permanent, [False, True, True, False, True, True])
+    def test_the_dash_works_with_or_without_a_space_after_it(self):
+        permanent = main._classify_batch_lines(["- https://a", "-https://b"])
+        self.assertEqual(permanent, [True, True])
 
-    def test_each_mirror_of_the_same_series_needs_its_own_tag(self):
-        permanent = main._classify_batch_lines(
-            [self.KEEP, "https://serienstream.to/serie/x", "https://burningseries.ac/serie/X"]
-        )
-        self.assertEqual(permanent, [True, True, False])
+    def test_several_dash_tagged_entries_can_be_scattered_through_the_file(self):
+        permanent = main._classify_batch_lines(["https://a", "-https://b", "https://c", "-https://d"])
+        self.assertEqual(permanent, [False, True, False, True])
 
 
 class TestSectionAwareWriters(SectionCase):
-    def test_added_urls_land_at_the_end_untagged(self):
+    def test_added_urls_land_above_the_marker(self):
+        """Appending to the end would drop them into the keep section and
+        quietly make them permanent."""
         self.write("https://a", self.KEEP, "https://keepme")
         main._append_batch_urls(self.path, ["https://new"])
 
         lines = self.read()
-        self.assertEqual(self.urls(lines), ["https://a", "https://keepme", "https://new"])
-        permanent = main._classify_batch_lines(lines)
-        self.assertFalse(permanent[lines.index("https://new")], "a freshly added URL was tagged permanent")
+        self.assertLess(lines.index("https://new"), lines.index(self.KEEP))
+        self.assertIn("https://keepme", lines)
 
-    def test_adding_to_a_file_with_no_tags_still_just_appends(self):
+    def test_adding_to_a_file_with_no_marker_still_just_appends(self):
         self.write("https://a")
         main._append_batch_urls(self.path, ["https://new"])
         self.assertEqual(self.urls(), ["https://a", "https://new"])
 
-    def test_replacing_the_working_list_keeps_tagged_entries(self):
+    def test_replacing_the_working_list_keeps_the_permanent_block(self):
         self.write("https://old1", "https://old2", self.KEEP, "https://keepme")
         main._replace_batch_urls(self.path, ["https://fresh"])
 
-        self.assertEqual(self.urls(), ["https://keepme", "https://fresh"])
+        self.assertEqual(self.urls(), ["https://fresh", "https://keepme"])
         self.assertIn(self.KEEP, self.read())
 
-    def test_replacing_a_file_with_no_tags_replaces_everything(self):
+    def test_replacing_also_keeps_a_dash_tagged_line_above_the_marker(self):
+        self.write("https://old", "-https://pinned", self.KEEP, "https://keepme")
+        main._replace_batch_urls(self.path, ["https://fresh"])
+
+        self.assertEqual(self.urls(), ["https://fresh", "-https://pinned", "https://keepme"])
+
+    def test_replacing_a_file_with_no_marker_still_keeps_a_dash_tagged_line(self):
+        self.write("https://old1", "-https://pinned")
+        main._replace_batch_urls(self.path, ["https://fresh"])
+        self.assertEqual(self.urls(), ["https://fresh", "-https://pinned"])
+
+    def test_replacing_a_file_using_neither_mechanism_replaces_everything(self):
         self.write("https://old1", "https://old2")
         main._replace_batch_urls(self.path, ["https://fresh"])
         self.assertEqual(self.urls(), ["https://fresh"])
@@ -1203,13 +1210,13 @@ class TestSectionAwareWriters(SectionCase):
         self.write("https://a", "https://b", "# a note", self.KEEP, "https://keepme")
         self.assertEqual(main._batch_section_counts(self.path), (2, 1))
 
-    def test_section_counts_with_scattered_tags(self):
-        self.write("https://a", self.KEEP, "https://b", "https://c", self.KEEP, "https://d")
-        self.assertEqual(main._batch_section_counts(self.path), (2, 2))
+    def test_section_counts_with_a_dash_tag_above_the_marker(self):
+        self.write("https://a", "-https://b", self.KEEP, "https://keepme")
+        self.assertEqual(main._batch_section_counts(self.path), (1, 2))
 
 
-class TestLoadUrlBatchesWithTags(SectionCase):
-    def test_permanent_entries_are_still_loaded_like_any_other(self):
+class TestLoadUrlBatchesWithSections(SectionCase):
+    def test_permanent_entries_below_the_marker_are_loaded_like_any_other(self):
         """'Permanent' means the file keeps them, not that they are skipped."""
         self.write(
             "https://serienstream.to/serie/one",
@@ -1223,10 +1230,50 @@ class TestLoadUrlBatchesWithTags(SectionCase):
             ["https://serienstream.to/serie/one", "https://serienstream.to/serie/two"],
         )
 
-    def test_the_tag_is_not_reported_as_an_unsupported_line(self):
+    def test_the_marker_is_not_reported_as_an_unsupported_line(self):
         self.write("https://serienstream.to/serie/one", self.KEEP)
         _grouped, rejected = main.load_url_batches(self.path)
         self.assertEqual(rejected, [])
+
+    def test_a_dash_tagged_url_loads_with_the_dash_stripped(self):
+        self.write("-https://serienstream.to/serie/pinned")
+        grouped, rejected = main.load_url_batches(self.path)
+        self.assertEqual(rejected, [])
+        self.assertEqual(grouped["serienstream.to"], ["https://serienstream.to/serie/pinned"])
+
+    def test_a_dash_with_a_space_before_the_url_also_loads(self):
+        self.write("- https://serienstream.to/serie/pinned")
+        grouped, _rejected = main.load_url_batches(self.path)
+        self.assertEqual(grouped["serienstream.to"], ["https://serienstream.to/serie/pinned"])
+
+    def test_a_bare_dash_with_nothing_usable_after_it_is_rejected_not_crashed(self):
+        self.write("-not-a-url")
+        _grouped, rejected = main.load_url_batches(self.path)
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0]["reason"], "missing http(s)://")
+
+
+class TestRewriteBatchUrlsPreservesDashTag(SectionCase):
+    """A migrated URL keeps whatever tag it had, so a host failover does not
+    silently un-pin a series the user marked permanent."""
+
+    def test_a_dash_tagged_url_keeps_its_tag_after_migration(self):
+        self.write("-https://old", "https://untouched")
+        changed = main._rewrite_batch_urls(self.path, {"https://old": "https://new"})
+        self.assertTrue(changed)
+        self.assertEqual(self.read(), ["-https://new", "https://untouched"])
+
+    def test_an_untagged_url_is_rewritten_plainly(self):
+        self.write("https://old")
+        changed = main._rewrite_batch_urls(self.path, {"https://old": "https://new"})
+        self.assertTrue(changed)
+        self.assertEqual(self.read(), ["https://new"])
+
+    def test_no_match_leaves_the_dash_tagged_line_untouched(self):
+        self.write("-https://old")
+        changed = main._rewrite_batch_urls(self.path, {"https://other": "https://new"})
+        self.assertFalse(changed)
+        self.assertEqual(self.read(), ["-https://old"])
 
 
 class TestClearTemporaryUrls(SectionCase, unittest.IsolatedAsyncioTestCase):
@@ -1260,7 +1307,13 @@ class TestClearTemporaryUrls(SectionCase, unittest.IsolatedAsyncioTestCase):
         self.assertIn("# currently watching", self.read())
         self.assertEqual(self.urls(), ["https://keepme"])
 
-    async def test_a_file_with_no_tags_clears_everything_but_warns_first(self):
+    async def test_a_dash_tagged_url_survives_with_no_marker_in_the_file(self):
+        self.write("https://a", "-https://pinned")
+        with mock.patch.object(main, "ask_yes_no", return_value=True):
+            await main.clear_temporary_urls(self.path)
+        self.assertEqual(self.urls(), ["-https://pinned"])
+
+    async def test_a_file_using_neither_mechanism_clears_everything_but_warns_first(self):
         self.write("https://a", "https://b")
         printed = []
         with (
@@ -1268,7 +1321,7 @@ class TestClearTemporaryUrls(SectionCase, unittest.IsolatedAsyncioTestCase):
             mock.patch("builtins.print", side_effect=lambda *a, **k: printed.append(" ".join(str(x) for x in a))),
         ):
             await main.clear_temporary_urls(self.path)
-        self.assertTrue(any("tagged permanent" in line for line in printed), "the user was not warned")
+        self.assertTrue(any("nothing is protected" in line for line in printed), "the user was not warned")
         self.assertEqual(self.urls(), [])
 
     async def test_the_urls_it_will_remove_are_shown_before_asking(self):
@@ -1284,17 +1337,13 @@ class TestClearTemporaryUrls(SectionCase, unittest.IsolatedAsyncioTestCase):
         self.assertIn("https://b", body)
         self.assertNotIn("https://keepme", body, "a kept URL was listed as doomed")
 
-    async def test_scattered_tags_are_all_respected(self):
-        self.write("https://a", self.KEEP, "https://b", "https://c", self.KEEP, "https://d")
-        with mock.patch.object(main, "ask_yes_no", return_value=True):
-            await main.clear_temporary_urls(self.path)
-        self.assertEqual(self.urls(), ["https://b", "https://d"])
 
 
 class TestBatchRewritersKeepThePermanentSection(SectionCase, unittest.IsolatedAsyncioTestCase):
-    """Both of these replace the batch file wholesale. Before tagged entries
-    existed that was fine; now a full truncate would delete exactly the
-    entries the user tagged permanent."""
+    """Both of these replace the batch file wholesale. Before the keep
+    section existed that was fine; now a full truncate would delete exactly
+    the entries the user marked permanent -- by block or by a single '-'
+    tag."""
 
     async def test_retry_replaces_only_the_working_list(self):
         self.write("https://old", self.KEEP, "https://keepme")
@@ -1304,8 +1353,18 @@ class TestBatchRewritersKeepThePermanentSection(SectionCase, unittest.IsolatedAs
         ):
             await main.retry_failed_urls(self.path)
 
-        self.assertEqual(self.urls(), ["https://keepme", "https://failed-one"])
+        self.assertEqual(self.urls(), ["https://failed-one", "https://keepme"])
         self.assertIn(self.KEEP, self.read())
+
+    async def test_retry_also_keeps_a_dash_tagged_url_above_the_marker(self):
+        self.write("https://old", "-https://pinned", self.KEEP, "https://keepme")
+        with (
+            mock.patch.object(main, "_load_failed_urls", return_value=["https://failed-one"]),
+            mock.patch.object(main, "ask_yes_no", return_value=True),
+        ):
+            await main.retry_failed_urls(self.path)
+
+        self.assertEqual(self.urls(), ["https://failed-one", "-https://pinned", "https://keepme"])
 
     async def test_retry_declined_leaves_the_file_alone(self):
         self.write("https://old", self.KEEP, "https://keepme")
@@ -1333,7 +1392,7 @@ class TestBatchRewritersKeepThePermanentSection(SectionCase, unittest.IsolatedAs
         ):
             await main._detect_and_add_input(self.path)
 
-        self.assertEqual(self.urls(), ["https://serienstream.to/serie/keepme", pasted])
+        self.assertEqual(self.urls(), [pasted, "https://serienstream.to/serie/keepme"])
         self.assertIn(self.KEEP, self.read())
 
     async def test_pasting_an_unsupported_url_changes_nothing(self):
