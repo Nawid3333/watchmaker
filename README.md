@@ -229,7 +229,6 @@ WATCHMAKER_STO_URLS=/path/to/S.to HTTPX scraper/series_urls.txt
 ├── config.py                # Domains, credentials, export targets, paths
 ├── main.py                  # Entry point & interactive menu
 ├── requirements.txt         # Python dependencies
-├── ruff.toml                # Lint/format configuration
 └── tests/
     └── test_watchmaker.py   # Unit tests
 ```
