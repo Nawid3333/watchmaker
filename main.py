@@ -23,10 +23,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from bs4 import BeautifulSoup
 
-ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT))
-
-from config import (  # noqa: E402
+from config import (
     CREDENTIALS,
     DEFAULT_BATCH_FILE,
     DOMAIN_ORDER,
@@ -34,6 +31,7 @@ from config import (  # noqa: E402
     HTTP_REQUEST_TIMEOUT,
     LOG_FILE,
     LOGS_DIR,
+    RETRY_BATCH_FILE,
     SERIES_URLS_EXPORTS,
     SUPPORTED_DOMAINS,
     USER_AGENT,
@@ -347,7 +345,7 @@ def load_url_batches(source: str) -> tuple[dict[str, list[str]], list[dict]]:
         if not line or line.startswith("#"):
             continue
         if line.startswith(PERMANENT_PREFIX):
-            line = line[len(PERMANENT_PREFIX):].strip()
+            line = line[len(PERMANENT_PREFIX) :].strip()
         if not line.startswith(("http://", "https://")):
             rejected.append({"line": line, "reason": "missing http(s)://"})
             continue
@@ -380,6 +378,9 @@ def load_url_batches(source: str) -> tuple[dict[str, list[str]], list[dict]]:
 
 # ==================== HOST CHECK ====================
 _PASSWORD_INPUT_RE = re.compile(r"<input[^>]+type\s*=\s*['\"]?password", re.IGNORECASE)
+# A form that posts to a login endpoint. Structural, like the password field,
+# rather than a word that happens to appear on the page.
+_LOGIN_FORM_RE = re.compile(r"<form[^>]*\baction\s*=\s*['\"]?[^'\"\s>]*/?login\b", re.IGNORECASE)
 
 
 def _looks_like_login_page(html: str) -> bool:
@@ -387,13 +388,17 @@ def _looks_like_login_page(html: str) -> bool:
 
     A password field is what a login page has and a parked domain, a proxy
     error page or a stale mirror does not, and unlike a word it does not
-    depend on the page's language. The text checks stay on as alternatives, so
-    a redesign that renamed the input would still pass here.
+    depend on the page's language.
+
+    This used to fall back to "login" appearing anywhere in the markup, which
+    accepted precisely the pages the check exists to reject: the word sits in
+    the nav of a parked domain and in the body of a Cloudflare block page.
+    That mattered because the mirror chosen from this result is written into
+    the batch file on disk before a single login is attempted. A form posting
+    to /login is kept as the one alternative, because that is a claim about
+    the page's structure rather than its wording.
     """
-    if _PASSWORD_INPUT_RE.search(html):
-        return True
-    lowered = html.lower()
-    return "login" in lowered or "anmelden" in lowered
+    return bool(_PASSWORD_INPUT_RE.search(html) or _LOGIN_FORM_RE.search(html))
 
 
 async def check_host(client: httpx.AsyncClient, host: str) -> tuple[bool, str]:
@@ -511,8 +516,24 @@ async def resolve_active_hosts(
             statuses[host] = f"FAIL -> {active_host}"
             logger.warning("Migrated %d URL(s) from %s to %s", len(migrated), host, active_host)
 
+    # Dedupe by series identity, not by URL string. load_url_batches already
+    # collapsed duplicates per host, but that ran *before* the rewrite above
+    # moved every family onto one mirror -- so /serie/x from one mirror and
+    # /serie/x/staffel-3 from another arrive here as two different strings
+    # naming one series, and dict.fromkeys kept both. Each would then be
+    # fetched, marked and verified twice and counted twice in the report.
     for host in resolved:
-        resolved[host] = list(dict.fromkeys(resolved[host]))
+        seen_series: set[tuple[str, str]] = set()
+        unique: list[str] = []
+        for url in resolved[host]:
+            classification = classify_url(url)
+            key = (classification[0], classification[2].lower()) if classification else ("", url)
+            if key in seen_series:
+                logger.info("Skipping duplicate series URL after mirror migration: %s", url)
+                continue
+            seen_series.add(key)
+            unique.append(url)
+        resolved[host] = unique
 
     if rewrites and _rewrite_batch_urls(urls_file, rewrites):
         print(f"\n  → rewritten {len(rewrites)} URL(s) to active hosts:")
@@ -1353,9 +1374,7 @@ async def process_batch(
         # Hosts run together; each one's own series stay sequential. Different
         # servers, different workers, different sessions -- no site sees more
         # than one request at a time from this run.
-        per_host = await asyncio.gather(
-            *(mark_host(host, worker) for host, worker in zip(hosts, workers, strict=True))
-        )
+        per_host = await asyncio.gather(*(mark_host(host, worker) for host, worker in zip(hosts, workers, strict=True)))
 
     # Merged in host order, not completion order, so the report and the
     # failed-URL file do not depend on which host happened to finish first.
@@ -1408,9 +1427,7 @@ def _persist_failed_urls(report: RunReport, attempted_urls: set[str], action: st
         # failed again.
 
     already = {(e["url"], e["action"]) for e in kept}
-    reconciled = kept + [
-        {"url": url, "action": action} for url in sorted(failed_now) if (url, action) not in already
-    ]
+    reconciled = kept + [{"url": url, "action": action} for url in sorted(failed_now) if (url, action) not in already]
     reconciled.sort(key=lambda e: (e["url"], e["action"]))
 
     Path(FAILED_URLS_FILE).parent.mkdir(parents=True, exist_ok=True)
@@ -1566,11 +1583,18 @@ def _replace_batch_urls(path: str, urls: list[str]) -> None:
     Both callers used to truncate the whole file. That would delete the
     keep block, and would also delete any individually '-'-tagged line that
     happened to be above the marker, which this feature exists to prevent.
+
+    New URLs go *after* what survives, not before it. Prepending put them
+    above the file's own header comment and above the pinned entries, so a
+    hand-maintained list came back reshuffled every time a URL was pasted in.
+    Orphaned comments -- ones whose entry was just removed -- are deliberately
+    left alone: a stale note is a smaller problem than silently deleting
+    something the user typed.
     """
     lines = _read_lines(path)
     temporary, keep = _split_batch_sections(lines)
     survivors = [line for line in temporary if not _is_entry_line(line) or _is_individually_tagged(line)]
-    _write_batch_sections(path, list(urls) + survivors, keep)
+    _write_batch_sections(path, survivors + list(urls), keep)
 
 
 def _batch_section_counts(path: str) -> tuple[int, int]:
@@ -1595,7 +1619,7 @@ def _rewrite_batch_urls(path: str, mapping: dict[str, str]) -> bool:
     for line in lines:
         stripped = line.strip()
         tagged = stripped.startswith(PERMANENT_PREFIX)
-        key = stripped[len(PERMANENT_PREFIX):].strip() if tagged else stripped
+        key = stripped[len(PERMANENT_PREFIX) :].strip() if tagged else stripped
         new = mapping.get(key)
         if new and new != key:
             out.append(PERMANENT_PREFIX + new if tagged else new)
@@ -2148,7 +2172,11 @@ async def clear_temporary_urls(urls_file: str) -> None:
 
 
 async def retry_failed_urls(urls_file: str) -> str:
-    """Replace the batch file with the recorded failed URLs."""
+    """Load recorded failed URLs into a separate retry batch file.
+
+    The user's main batch file is left untouched; retrying writes the
+    failed URLs to RETRY_BATCH_FILE and switches the active batch to it.
+    """
     entries = _load_failed_entries()
     failed = _load_failed_urls()
     if not failed:
@@ -2174,14 +2202,16 @@ async def retry_failed_urls(urls_file: str) -> str:
     if len(by_action) > 1:
         print("\n    ⚠ these came from different actions; run each option in turn.")
 
-    if not ask_yes_no("\n  replace current batch with these failed URLs?"):
+    if not ask_yes_no("\n  write failed URLs to the retry batch?"):
         print("  retry cancelled.")
         return urls_file
 
-    _replace_batch_urls(urls_file, failed)
-    print(f"  wrote {len(failed)} failed URL(s) → {urls_file}")
-    logger.info("Wrote %d failed URL(s) to %s", len(failed), urls_file)
-    return urls_file
+    Path(RETRY_BATCH_FILE).parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write(RETRY_BATCH_FILE, "".join(url + "\n" for url in failed))
+    print(f"  wrote {len(failed)} failed URL(s) → {RETRY_BATCH_FILE}")
+    print(f"  active batch switched → {RETRY_BATCH_FILE}")
+    logger.info("Wrote %d failed URL(s) to %s", len(failed), RETRY_BATCH_FILE)
+    return RETRY_BATCH_FILE
 
 
 async def _detect_and_add_input(urls_file: str) -> str:
@@ -2238,9 +2268,7 @@ async def main() -> None:
     print_batch_summary(initial_grouped, header="loaded batch", rejected=rejected)
 
     print("\n  → checking hosts ...")
-    resolved, host_statuses, active_host_by_family = await resolve_active_hosts(
-        urls_file, preloaded=batch
-    )
+    resolved, host_statuses, active_host_by_family = await resolve_active_hosts(urls_file, preloaded=batch)
 
     async def refresh() -> None:
         nonlocal resolved, host_statuses, active_host_by_family, rejected
@@ -2250,9 +2278,7 @@ async def main() -> None:
         # Reusing this parse across the rewrite resolve_active_hosts may do
         # is safe: _rewrite_batch_urls swaps mapped URLs in place and leaves
         # comments and unsupported lines -- the rejected ones -- untouched.
-        resolved, host_statuses, active_host_by_family = await resolve_active_hosts(
-            urls_file, preloaded=batch
-        )
+        resolved, host_statuses, active_host_by_family = await resolve_active_hosts(urls_file, preloaded=batch)
 
     while True:
         print_banner()
@@ -2284,9 +2310,22 @@ async def main() -> None:
             print("  invalid option.")
 
 
-if __name__ == "__main__":
+def _run_cli() -> int:
+    """Run main() and return a process exit code.
+
+    Separate from main() so tests and packaging entry points can call it.
+    """
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n  interrupted.")
-        sys.exit(1)
+        return 130
+    except SystemExit as exc:
+        if exc.code is None:
+            return 0
+        return exc.code if isinstance(exc.code, int) else 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_run_cli())

@@ -53,14 +53,14 @@ Each host is pinged once; unreachable hosts are skipped, and reachable family mi
 
 ### Menu options
 
-0. Exit
 1. Mark as **WATCHED**
 2. Mark as **UNWATCHED**
 3. Export URLs to scraper lists
 4. Import URLs from scraper lists
-5. Add / change batch
+5. Add link / change batch
 6. Retry failed URLs
 7. Clear temporary entries
+8. Exit
 
 Before marking, a preview of every series, season, and current episode count is shown. For the aniworld and s.to families the preview also shows the current subscription (`Sub`) and watchlist (`WL`) status per series, plus a `⚡` badge when a subscription change is pending. Confirm with **y** to proceed or **n** to cancel.
 
@@ -100,7 +100,7 @@ A season counts as successful only when the episode page, re-read after the requ
 - Every mark is verified by re-fetching the season page, whether a request was sent or the season was already at the target state. These sites answer `HTTP 200` even when nothing changed, so the response status alone proves nothing.
 - A season page where no episode rows can be parsed is reported as **failed** (`no episodes found`), never as a silent success — an unreadable page means the result cannot be verified.
 - If verification itself fails (network error, error page), the season is reported as **unverified** and lands in the retry list. Re-running is safe: a season already at the target state issues no request.
-- `✓` is action-aware: a fully *unwatched* series is a success at 0 watched episodes.
+- `✓` is action-aware: a fully _unwatched_ series is a success at 0 watched episodes.
 - If a session expires mid-batch, watchmaker re-authenticates once and retries that season before giving up.
 - A retired or mistyped slug is answered by these sites with the catalogue page at `HTTP 200`. Such a page is rejected by name (`Alle Serien`, `Andere Serien`, ...) instead of being marked as if it were a real series.
 

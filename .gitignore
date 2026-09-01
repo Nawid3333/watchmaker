@@ -19,6 +19,11 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+MANIFEST
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+.ruff_cache/
 
 # Virtual environments
 venv/
@@ -26,7 +31,7 @@ env/
 ENV/
 
 # Logs
-logs/*
+logs/
 
 # Local data
 data/*
@@ -36,3 +41,10 @@ data/*
 .idea/
 
 series_urls.txt
+
+# Coverage output (pytest --cov)
+.coverage
+.coverage.*
+coverage.json
+coverage.xml
+htmlcov/

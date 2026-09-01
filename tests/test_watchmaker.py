@@ -601,9 +601,32 @@ class TestLoginPageDetection(unittest.TestCase):
             with self.subTest(html):
                 self.assertTrue(main._looks_like_login_page(html))
 
-    def test_wording_alone_is_enough_in_either_language(self):
-        self.assertTrue(main._looks_like_login_page("<body>Bitte anmelden</body>"))
-        self.assertTrue(main._looks_like_login_page("<body>Please Login</body>"))
+    def test_a_login_form_identifies_a_login_page_without_a_password_field(self):
+        """A form posting at /login is the one accepted alternative.
+
+        It is a claim about the page's structure, which is what separates a
+        real login page from a page that merely mentions logging in.
+        """
+        self.assertTrue(main._looks_like_login_page('<form action="/login" method="post">'))
+        self.assertTrue(main._looks_like_login_page("<form action='https://x.tld/login'>"))
+
+    def test_wording_alone_is_not_enough(self):
+        """The word is not evidence -- it is what the impostors have too.
+
+        This check decides which mirror becomes active, and that choice is
+        written into the batch file on disk before any login is attempted.
+        A parked domain and a Cloudflare block page both carry the word in
+        their nav or body, so accepting it defeated the whole check.
+        """
+        for html in (
+            "<body>Bitte anmelden</body>",
+            "<body>Please Login</body>",
+            "<body>Site offline<script>var loginUrl='/x'</script></body>",
+            "<html><title>Attention Required! | Cloudflare</title>"
+            "<body>Error 1020<a href='/login'>Login</a></body></html>",
+        ):
+            with self.subTest(html):
+                self.assertFalse(main._looks_like_login_page(html))
 
     def test_a_page_that_is_not_a_login_page_is_rejected(self):
         for html in ("", PARKED_PAGE, "<body>502 Bad Gateway</body>", "not markup"):
@@ -711,6 +734,41 @@ class TestActiveHostResolution(unittest.IsolatedAsyncioTestCase):
             ["https://aniworld.to/anime/stream/demo"],
             "nothing to migrate to means the file must be left untouched",
         )
+
+    async def test_one_series_reached_by_two_mirrors_is_marked_once(self):
+        """Duplicates must be collapsed after the rewrite, not only before it.
+
+        load_url_batches collapses by (host, slug), which runs while the two
+        URLs still sit on different hosts and therefore looks like two
+        different series. Once both are rewritten onto the active mirror they
+        name the same show, and the exact-string dedupe that followed kept
+        both -- so every season was fetched, marked and verified twice, and
+        the run summary counted the series twice.
+        """
+        path = self._batch(
+            "https://serienstream.to/serie/some-show",
+            "https://serienstream.cx/serie/some-show/staffel-3",
+        )
+
+        with mock.patch.object(main, "check_hosts", self._statuses({"serienstream.to", "serienstream.cx"})):
+            resolved, _statuses, active = await main.resolve_active_hosts(path)
+
+        self.assertEqual(active.get("sto"), "serienstream.to")
+        queued = [url for urls in resolved.values() for url in urls]
+        slugs = [main.slug_for(url, "sto") for url in queued]
+        self.assertEqual(slugs, ["some-show"], f"one series must be queued once, got {queued}")
+
+    async def test_genuinely_different_series_on_two_mirrors_both_survive(self):
+        path = self._batch(
+            "https://serienstream.to/serie/show-one",
+            "https://serienstream.cx/serie/show-two",
+        )
+
+        with mock.patch.object(main, "check_hosts", self._statuses({"serienstream.to", "serienstream.cx"})):
+            resolved, _statuses, _active = await main.resolve_active_hosts(path)
+
+        slugs = sorted(main.slug_for(u, "sto") for urls in resolved.values() for u in urls)
+        self.assertEqual(slugs, ["show-one", "show-two"])
 
 
 # ==================== login verification ====================
@@ -1037,9 +1095,7 @@ class TestProcessBatchAcrossHosts(HostFlowCase):
         plans = self._plans()
         for name in ("three", "four"):
             plans["serienstream.to"].append(
-                main.SeriesPlan(
-                    f"https://serienstream.to/serie/{name}", "serienstream.to", "sto", name, [1], name
-                )
+                main.SeriesPlan(f"https://serienstream.to/serie/{name}", "serienstream.to", "sto", name, [1], name)
             )
         ScriptedWorker.mark_delay = 0.01
         self.addCleanup(setattr, ScriptedWorker, "mark_delay", 0)
@@ -1094,9 +1150,7 @@ class TestBatchIsParsedOnce(unittest.IsolatedAsyncioTestCase):
 
         await main.resolve_active_hosts("batch.txt", preloaded=batch)
 
-        self.assertEqual(
-            len(self.calls), 1, "resolve_active_hosts must not re-read a file the caller just parsed"
-        )
+        self.assertEqual(len(self.calls), 1, "resolve_active_hosts must not re-read a file the caller just parsed")
 
     async def test_without_a_preloaded_batch_the_file_is_still_read(self):
         """Callers that have not already parsed it must keep working."""
@@ -1194,12 +1248,13 @@ class TestSectionAwareWriters(SectionCase):
         self.write("https://old", "-https://pinned", self.KEEP, "https://keepme")
         main._replace_batch_urls(self.path, ["https://fresh"])
 
-        self.assertEqual(self.urls(), ["https://fresh", "-https://pinned", "https://keepme"])
+        # New URLs land after what survives, so a pinned entry keeps its place.
+        self.assertEqual(self.urls(), ["-https://pinned", "https://fresh", "https://keepme"])
 
     def test_replacing_a_file_with_no_marker_still_keeps_a_dash_tagged_line(self):
         self.write("https://old1", "-https://pinned")
         main._replace_batch_urls(self.path, ["https://fresh"])
-        self.assertEqual(self.urls(), ["https://fresh", "-https://pinned"])
+        self.assertEqual(self.urls(), ["-https://pinned", "https://fresh"])
 
     def test_replacing_a_file_using_neither_mechanism_replaces_everything(self):
         self.write("https://old1", "https://old2")
@@ -1338,50 +1393,51 @@ class TestClearTemporaryUrls(SectionCase, unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("https://keepme", body, "a kept URL was listed as doomed")
 
 
-
 class TestBatchRewritersKeepThePermanentSection(SectionCase, unittest.IsolatedAsyncioTestCase):
-    """Both of these replace the batch file wholesale. Before the keep
-    section existed that was fine; now a full truncate would delete exactly
-    the entries the user marked permanent -- by block or by a single '-'
-    tag."""
+    """Retrying now uses a separate retry batch file, so the user's main
+    batch file is no longer overwritten."""
 
-    async def test_retry_replaces_only_the_working_list(self):
+    async def test_retry_does_not_modify_the_main_batch_file(self):
         self.write("https://old", self.KEEP, "https://keepme")
+        before = self.read()
+        retry_path = os.path.join(self.dir.name, "retry.txt")
         with (
             mock.patch.object(main, "_load_failed_urls", return_value=["https://failed-one"]),
+            mock.patch.object(main, "RETRY_BATCH_FILE", retry_path),
             mock.patch.object(main, "ask_yes_no", return_value=True),
         ):
-            await main.retry_failed_urls(self.path)
+            result = await main.retry_failed_urls(self.path)
+        self.assertEqual(self.read(), before)
+        self.assertEqual(result, retry_path)
+        self.assertTrue(os.path.exists(result))
+        self.assertEqual(Path(result).read_text(encoding="utf-8").splitlines(), ["https://failed-one"])
 
-        self.assertEqual(self.urls(), ["https://failed-one", "https://keepme"])
-        self.assertIn(self.KEEP, self.read())
-
-    async def test_retry_also_keeps_a_dash_tagged_url_above_the_marker(self):
-        self.write("https://old", "-https://pinned", self.KEEP, "https://keepme")
-        with (
-            mock.patch.object(main, "_load_failed_urls", return_value=["https://failed-one"]),
-            mock.patch.object(main, "ask_yes_no", return_value=True),
-        ):
-            await main.retry_failed_urls(self.path)
-
-        self.assertEqual(self.urls(), ["https://failed-one", "-https://pinned", "https://keepme"])
-
-    async def test_retry_declined_leaves_the_file_alone(self):
+    async def test_retry_canceled_leaves_the_main_batch_file_alone(self):
         self.write("https://old", self.KEEP, "https://keepme")
-        before = Path(self.path).read_text(encoding="utf-8")
+        before = self.read()
+        retry_path = os.path.join(self.dir.name, "retry.txt")
         with (
             mock.patch.object(main, "_load_failed_urls", return_value=["https://failed-one"]),
+            mock.patch.object(main, "RETRY_BATCH_FILE", retry_path),
             mock.patch.object(main, "ask_yes_no", return_value=False),
         ):
-            await main.retry_failed_urls(self.path)
-        self.assertEqual(Path(self.path).read_text(encoding="utf-8"), before)
+            result = await main.retry_failed_urls(self.path)
+        self.assertEqual(self.read(), before)
+        self.assertEqual(result, self.path)
+        self.assertFalse(os.path.exists(retry_path))
 
-    async def test_retry_with_nothing_recorded_does_not_touch_the_file(self):
+    async def test_retry_with_nothing_recorded_does_not_touch_any_file(self):
         self.write("https://old", self.KEEP, "https://keepme")
-        before = Path(self.path).read_text(encoding="utf-8")
-        with mock.patch.object(main, "_load_failed_urls", return_value=[]):
-            await main.retry_failed_urls(self.path)
-        self.assertEqual(Path(self.path).read_text(encoding="utf-8"), before)
+        before = self.read()
+        retry_path = os.path.join(self.dir.name, "retry.txt")
+        with (
+            mock.patch.object(main, "_load_failed_urls", return_value=[]),
+            mock.patch.object(main, "RETRY_BATCH_FILE", retry_path),
+        ):
+            result = await main.retry_failed_urls(self.path)
+        self.assertEqual(self.read(), before)
+        self.assertEqual(result, self.path)
+        self.assertFalse(os.path.exists(retry_path))
 
     async def test_pasting_a_url_replaces_only_the_working_list(self):
         self.write("https://old", self.KEEP, "https://serienstream.to/serie/keepme")
@@ -1531,11 +1587,16 @@ class TestRetryShowsTheAction(FailedStoreCase, unittest.IsolatedAsyncioTestCase)
     def setUp(self):
         super().setUp()
         self.batch = os.path.join(self.dir.name, "series_urls.txt")
+        self.retry_batch = os.path.join(self.dir.name, "retry_batch.txt")
         Path(self.batch).write_text("", encoding="utf-8")
+
+    def _with_retry_batch(self):
+        return mock.patch.object(main, "RETRY_BATCH_FILE", self.retry_batch)
 
     async def _retry_output(self):
         printed = []
         with (
+            self._with_retry_batch(),
             mock.patch.object(main, "ask_yes_no", return_value=False),
             mock.patch("builtins.print", side_effect=lambda *a, **k: printed.append(" ".join(str(x) for x in a))),
         ):
@@ -1544,21 +1605,67 @@ class TestRetryShowsTheAction(FailedStoreCase, unittest.IsolatedAsyncioTestCase)
 
     async def test_it_names_the_action_and_the_option_to_use(self):
         self.record(ACTION_WATCHED, {self.X: False})
-        body = await self._retry_output()
+        with self._with_retry_batch():
+            body = await self._retry_output()
         self.assertIn("WATCHED", body)
         self.assertIn("option 1", body)
 
     async def test_unwatched_failures_point_at_option_2(self):
         self.record(ACTION_UNWATCHED, {self.X: False})
-        body = await self._retry_output()
+        with self._with_retry_batch():
+            body = await self._retry_output()
         self.assertIn("UNWATCHED", body)
         self.assertIn("option 2", body)
+
+    async def test_retry_creates_the_retry_batch_and_returns_it(self):
+        self.record(ACTION_WATCHED, {self.X: False})
+        with (
+            self._with_retry_batch(),
+            mock.patch.object(main, "ask_yes_no", return_value=True),
+        ):
+            result = await main.retry_failed_urls(self.batch)
+        self.assertEqual(result, self.retry_batch)
+        self.assertEqual(main._load_failed_urls(), [self.X])
+        self.assertEqual(Path(self.retry_batch).read_text(encoding="utf-8").splitlines(), [self.X])
+
+    async def test_retry_does_not_overwrite_the_original_batch_file(self):
+        original_body = "# existing\nhttps://original\n"
+        Path(self.batch).write_text(original_body, encoding="utf-8")
+        self.record(ACTION_WATCHED, {self.X: False})
+        with (
+            self._with_retry_batch(),
+            mock.patch.object(main, "ask_yes_no", return_value=True),
+        ):
+            await main.retry_failed_urls(self.batch)
+        self.assertEqual(Path(self.batch).read_text(encoding="utf-8"), original_body)
+
+    async def test_retry_canceled_leaves_files_alone(self):
+        original_body = "# existing\nhttps://original\n"
+        Path(self.batch).write_text(original_body, encoding="utf-8")
+        self.record(ACTION_WATCHED, {self.X: False})
+        with (
+            self._with_retry_batch(),
+            mock.patch.object(main, "ask_yes_no", return_value=False),
+        ):
+            result = await main.retry_failed_urls(self.batch)
+        self.assertEqual(result, self.batch)
+        self.assertEqual(Path(self.batch).read_text(encoding="utf-8"), original_body)
+        self.assertFalse(os.path.exists(self.retry_batch))
+
+    async def test_retry_with_nothing_recorded_does_not_touch_any_file(self):
+        original_body = "# existing\nhttps://original\n"
+        Path(self.batch).write_text(original_body, encoding="utf-8")
+        with self._with_retry_batch():
+            await main.retry_failed_urls(self.batch)
+        self.assertEqual(Path(self.batch).read_text(encoding="utf-8"), original_body)
+        self.assertFalse(os.path.exists(self.retry_batch))
 
     async def test_a_mixed_list_warns_that_both_options_are_needed(self):
         self.record(ACTION_WATCHED, {self.X: False})
         self.record(ACTION_UNWATCHED, {self.Y: False})
         body = await self._retry_output()
         self.assertIn("different actions", body)
+
 
 if __name__ == "__main__":
     unittest.main()

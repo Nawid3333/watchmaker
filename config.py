@@ -115,6 +115,7 @@ SERIES_URLS_EXPORTS: dict[str, str | None] = {
 
 # ==================== STATE FILES ====================
 FAILED_URLS_FILE = os.path.join(DATA_DIR, ".failed_urls.json")
+RETRY_BATCH_FILE = os.path.join(DATA_DIR, "retry_batch.txt")
 DEFAULT_BATCH_FILE = (
     DEFAULT_BATCH_FILE_PATH
     if os.path.isabs(DEFAULT_BATCH_FILE_PATH)
