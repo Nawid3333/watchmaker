@@ -35,6 +35,7 @@ from config import (
     SERIES_URLS_EXPORTS,
     SUPPORTED_DOMAINS,
     USER_AGENT,
+    ensure_env_file,
 )
 
 logger = logging.getLogger("watchmaker")
@@ -2315,6 +2316,16 @@ def _run_cli() -> int:
 
     Separate from main() so tests and packaging entry points can call it.
     """
+    # A fresh install has no .env anywhere, so write the template out rather than
+    # leaving the user a filename to hunt for. Deliberately non-fatal: the
+    # credential check further in reports what still needs filling in.
+    created = ensure_env_file()
+    if created:
+        print("")
+        print("Created a credentials file at:")
+        print(f"    {created}")
+        print("Fill in your details there, then run this again.")
+        print("")
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

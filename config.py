@@ -22,6 +22,41 @@ ENV_FILE = os.path.join(PROJECT_ROOT, ".env")
 load_dotenv(ENV_FILE)
 
 
+# The credentials template, written on first run by ensure_env_file(). This is
+# the single source of truth for it: tests/test_env_bootstrap.py asserts that
+# .env.example matches, so the shipped example cannot drift from what someone
+# installing the package actually receives.
+ENV_TEMPLATE = """# AniWorld.to Credentials
+# Fill in the values below. This file is never committed.
+ANIWORLD_EMAIL=
+ANIWORLD_PASSWORD=
+
+# BS.to Credentials
+BS_USERNAME=
+BS_PASSWORD=
+
+# S.to Credentials
+STO_EMAIL=
+STO_PASSWORD=
+"""
+
+
+def ensure_env_file():
+    """Write ENV_TEMPLATE to ENV_FILE if no .env exists there yet.
+
+    Returns the path written, or None when a file was already present -- an
+    existing .env is never read, altered or overwritten. Called from the CLI
+    entry point rather than at import time, because importing this module must
+    stay free of side effects: the test suite imports it constantly.
+    """
+    if os.path.exists(ENV_FILE):
+        return None
+    os.makedirs(os.path.dirname(ENV_FILE) or ".", exist_ok=True)
+    with open(ENV_FILE, "w", encoding="utf-8") as handle:
+        handle.write(ENV_TEMPLATE)
+    return ENV_FILE
+
+
 # ==================== SUPPORTED DOMAINS ====================
 # Map each exact host to its site family and credential key.
 # Dead primaries (bs.to, s.to) are intentionally omitted; the next reachable
