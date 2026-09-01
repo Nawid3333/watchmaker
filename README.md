@@ -55,7 +55,7 @@ Building a wheel puts a `watchmaker` command on your PATH:
 ```bash
 pip install build
 python -m build
-pip install dist/watchmaker-1.0.0-py3-none-any.whl
+pip install dist/watchmaker-2.0.0-py3-none-any.whl
 ```
 
 Two things are worth knowing before you do.
