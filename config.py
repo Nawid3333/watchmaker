@@ -10,9 +10,16 @@ from dotenv import load_dotenv
 
 # Resolve the project root once — used for .env loading, data/logs dirs, and
 # resolving relative paths in DEFAULT_BATCH_FILE_PATH / SERIES_URLS_EXPORTS.
-PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
-# Load environment variables from .env next to this config file (project root)
-load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
+#
+# Unset, WATCHMAKER_HOME leaves this as the repo checkout exactly as it always
+# was, so running from a clone is byte-for-byte unchanged. Setting it is what
+# makes an installed copy usable: in a venv this file sits inside
+# site-packages, where no user can reasonably find a .env to edit.
+_DEFAULT_HOME = os.path.abspath(os.path.dirname(__file__))
+PROJECT_ROOT = os.path.abspath(os.environ.get("WATCHMAKER_HOME") or _DEFAULT_HOME)
+# Load environment variables from .env at the project home
+ENV_FILE = os.path.join(PROJECT_ROOT, ".env")
+load_dotenv(ENV_FILE)
 
 
 # ==================== SUPPORTED DOMAINS ====================

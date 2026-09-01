@@ -14,9 +14,11 @@ When marking a series as **WATCHED** on the aniworld or s.to family, watchmaker 
 
 ## Requirements
 
-- Python 3.10+ — developed and tested on 3.14. The 3.10 floor comes from
-  `zip(strict=True)` and PEP 604 `X | None` annotations evaluated at runtime;
-  versions between 3.10 and 3.13 are expected to work but are not tested.
+- **Python 3.11+** — developed and tested on 3.14. `requires-python` in
+  `pyproject.toml` enforces 3.11, so pip will refuse anything older. The code
+  itself uses nothing newer than 3.10 features (`zip(strict=True)`, PEP 604
+  `X | None` annotations evaluated at runtime), so 3.10 would very likely work —
+  it is simply not tested.
 - Dependencies: `httpx`, `beautifulsoup4`, `lxml`, `h2`, `python-dotenv`
 
 `lxml` and `h2` are the speed-relevant ones: pages parse ~1.2x quicker than with
@@ -25,9 +27,16 @@ back gracefully if unavailable, at the old speed.
 
 ## Setup
 
-1. Install dependencies:
+1. Clone the repository and install dependencies:
 
    ```bash
+   git clone https://github.com/Nawid3333/watchmaker.git
+   cd watchmaker
+
+   python -m venv .venv
+   source .venv/bin/activate        # Linux / macOS
+   .venv\Scripts\Activate.ps1       # Windows (PowerShell)
+
    pip install -r requirements.txt
    ```
 
@@ -38,6 +47,45 @@ back gracefully if unavailable, at the old speed.
    ```
 
 3. Add series URLs to the default batch file (`series_urls.txt`), one per line. Lines starting with `#` are ignored. Two URLs pointing at the same series (for example `/serie/x` and `/serie/x/staffel-3`) mark the same thing, so only the first is used. To keep some entries around permanently instead of clearing them with option 7, see [The batch file has two parts](#the-batch-file-has-two-parts) below.
+
+### Install it as a command
+
+Building a wheel puts a `watchmaker` command on your PATH:
+
+```bash
+pip install build
+python -m build
+pip install dist/watchmaker-1.0.0-py3-none-any.whl
+```
+
+Two things are worth knowing before you do.
+
+**Give each program its own virtual environment.** This project and its siblings
+ship their code as the top-level modules `main` and `config`. Install two of them
+into the same environment and the second overwrites the first — the command still
+exists, but it silently runs the other program. `pipx` creates an isolated
+environment per application and avoids this entirely:
+
+```bash
+pipx install .
+```
+
+**Tell it where to keep your files.** Once installed, the package lives inside
+`site-packages`, which is no place to keep a `.env` you have to edit by hand.
+Point `WATCHMAKER_HOME` at a folder you own, and `.env` , the batch file, and the `data/` and `logs/` folders all move there:
+
+```bash
+export WATCHMAKER_HOME=~/watchmaker                # Linux / macOS
+$env:WATCHMAKER_HOME = "$HOME\watchmaker"          # Windows (PowerShell)
+
+mkdir -p ~/watchmaker
+cp .env.example ~/watchmaker/.env
+```
+
+`WATCHMAKER_HOME` has to be a real environment variable. It cannot be set inside `.env`,
+because it is what tells the program where to find that file in the first place.
+Left unset it resolves to the checkout, which is why running from a clone needs
+no configuration at all.
 
 ## Usage
 
@@ -137,6 +185,11 @@ For a one-off switch without editing any file, use option **5** while the progra
 ## Configuration
 
 See `config.py` for credentials, supported domains, export/import targets, and the default batch file path.
+
+`WATCHMAKER_HOME` decides where `.env`, the batch file, `data/` and `logs/` live.
+Unset, that is this checkout. Set it when you install the package, so those do
+not land in site-packages. It must be a real environment variable — it cannot go
+in `.env`, because it is what locates that file.
 
 Credentials are loaded from a `.env` file next to `config.py` (see `.env.example`):
 
