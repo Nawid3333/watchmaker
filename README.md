@@ -116,7 +116,7 @@ Each host is pinged once; unreachable hosts are skipped, and reachable family mi
 
 Before marking, a preview of every series, season, and current episode count is shown. For the aniworld and s.to families the preview also shows the current subscription (`Sub`) and watchlist (`WL`) status per series, plus a `⚡` badge when a subscription change is pending. Confirm with **y** to proceed or **n** to cancel.
 
-The preview is grouped rather than interleaved: **WILL CHANGE**, **ALREADY AT TARGET**, and **COULD NOT READ** are printed as separate blocks, so you can see at a glance what a run is actually going to do. Series already at the target state are reported as-is and are not touched again, so a re-run only does work where something has to change.
+The preview is grouped rather than interleaved: **ALREADY AT TARGET**, **WILL CHANGE**, and **COULD NOT READ** are printed as separate blocks, so you can see at a glance what a run is actually going to do. Series already at the target state are reported as-is and are not touched again, so a re-run only does work where something has to change.
 
 Marking runs every host at once. Each site keeps its own worker, session and strict one-series-at-a-time order, so no site ever sees two requests from a run — but finishing one host no longer leaves the others idle, which is what used to make switching from one domain to the next feel like a pause.
 

@@ -1944,13 +1944,13 @@ async def _preview(
                     # would be noise; the counter already says it is complete.
                     done_lines.append(headline)
 
-    if todo_lines:
-        _print_section("WILL CHANGE", len(todo))
-        for line in todo_lines:
-            print(line)
     if done_lines:
         _print_section("ALREADY AT TARGET", len(done))
         for line in done_lines:
+            print(line)
+    if todo_lines:
+        _print_section("WILL CHANGE", len(todo))
+        for line in todo_lines:
             print(line)
     if broken:
         _print_section("COULD NOT READ", len(broken))
@@ -1992,7 +1992,7 @@ async def run_action(action: str, grouped: dict[str, list[str]], rejected: list[
             print(f"\n  → nothing to do; all {len(done)} series already at target state ({action}).")
         return
 
-    print(f"\n  → {len(todo)} series to change, {len(done)} already at target state.")
+    print(f"\n  → {len(done)} already at target state, {len(todo)} series to change.")
     if not ask_yes_no("\n  proceed with marking?", default=False):
         print("  marking cancelled.")
         return
