@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "watchmaker"
-version = "2.0.2"
+version = "2.1.0"
 description = "Batch mark series as watched or unwatched on aniworld.to, bs.to, and s.to."
 readme = "README.md"
 license = "GPL-3.0-or-later"
