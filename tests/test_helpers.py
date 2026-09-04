@@ -18,7 +18,7 @@ import main as wm
 
 
 class TestAttrCoercion(unittest.TestCase):
-    """BeautifulSoup attributes are str, list[str] or absent; callers want one type."""
+    """Element attributes are str, list[str] or absent; callers want one type."""
 
     def test_a_string_attribute_is_returned(self):
         self.assertEqual(wm._attr_str("value"), "value")

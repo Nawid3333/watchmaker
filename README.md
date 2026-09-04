@@ -19,11 +19,10 @@ When marking a series as **WATCHED** on the aniworld or s.to family, watchmaker 
   itself uses nothing newer than 3.10 features (`zip(strict=True)`, PEP 604
   `X | None` annotations evaluated at runtime), so 3.10 would very likely work —
   it is simply not tested.
-- Dependencies: `httpx`, `beautifulsoup4`, `lxml`, `h2`, `python-dotenv`
+- Dependencies: `httpx`, `lxml`, `h2`, `python-dotenv`
 
-`lxml` and `h2` are the speed-relevant ones: pages parse ~1.2x quicker than with
-the stdlib parser, and HTTP/2 lets one connection carry many requests. Both fall
-back gracefully if unavailable, at the old speed.
+`lxml` and `h2` are the speed-relevant ones: pages parse ~4-6x quicker than with
+BeautifulSoup, and HTTP/2 lets one connection carry many requests.
 
 ## Setup
 

@@ -96,11 +96,11 @@ def test_classifying_a_url(bench):
 def test_parsing_a_season_page(bench):
     """One per season per series -- the parse a marking run repeats most."""
     html = _season_page()
-    soup = wm._soup(html)
+    doc = wm.make_doc(html)
     worker = wm.DomainWorker.__new__(wm.DomainWorker)
     worker.family = "sto"
-    assert worker._count_episodes(soup) == (12, SEASON_ROWS), "fixture must parse before it is timed"
-    bench("count_episodes/24_rows", lambda: worker._count_episodes(wm._soup(html)))
+    assert worker._count_episodes(doc) == (12, SEASON_ROWS), "fixture must parse before it is timed"
+    bench("count_episodes/24_rows", lambda: worker._count_episodes(wm.make_doc(html)))
 
 
 @pytest.mark.benchmark
@@ -108,12 +108,12 @@ def test_discovering_seasons_on_a_series_page(bench):
     html = _series_page()
     worker = wm.DomainWorker.__new__(wm.DomainWorker)
     worker.family = "sto"
-    assert len(worker.discover_seasons(wm._soup(html), "demo")) == 12
-    bench("discover_seasons/12_seasons", lambda: worker.discover_seasons(wm._soup(html), "demo"))
+    assert len(worker.discover_seasons(wm.make_doc(html), "demo")) == 12
+    bench("discover_seasons/12_seasons", lambda: worker.discover_seasons(wm.make_doc(html), "demo"))
 
 
 @pytest.mark.benchmark
 def test_soup_build(bench):
     """The parser choice underneath every page read; lxml vs stdlib shows here."""
     html = _season_page(rows=200)
-    bench("soup/200_row_season_page", lambda: wm._soup(html))
+    bench("soup/200_row_season_page", lambda: wm.make_doc(html))

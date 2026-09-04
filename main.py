@@ -18,10 +18,12 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Protocol
 from urllib.parse import urljoin, urlparse
 
 import httpx
-from bs4 import BeautifulSoup
+import lxml.etree
+import lxml.html
 
 import term
 from config import (
@@ -44,6 +46,33 @@ from term import cprint as print
 logger = logging.getLogger("watchmaker")
 # Keep importing this module silent; setup_logging() installs the real handlers.
 logger.addHandler(logging.NullHandler())
+
+
+# ── HTML parsing ────────────────────────────────────────────────────────────
+# Every page this module reads is parsed by make_doc, below. BeautifulSoup was
+# removed once the last of the page readers moved across, so there is now one
+# parser and one tree type. lxml was already a hard requirement (see
+# pyproject), so the old html.parser fallback could never fire and went with
+# it. lxml parses these sites' pages ~4-6x faster than BeautifulSoup, and the
+# parse is paid once per page on the event loop where it blocks every
+# concurrent fetch the pool has in flight.
+
+
+def _hc(name: str) -> str:
+    """XPath predicate matching one whitespace-delimited class token.
+
+    `contains(@class, 'seen')` would also match `unseen`, which is exactly
+    the kind of near-miss that turns into wrong watch data rather than an
+    error, so every class test goes through this.
+    """
+    return f"contains(concat(' ', normalize-space(@class), ' '), ' {name} ')"
+
+
+class _AsyncGetClient(Protocol):
+    """Minimal async client surface used by check_host."""
+
+    async def get(self, *args: Any, **kwargs: Any) -> httpx.Response: ...
+
 
 # ==================== CONSTANTS ====================
 REACHABILITY_TIMEOUT = 8.0
@@ -77,25 +106,26 @@ _WATCHED_CLASS_TOKENS = frozenset({"seen", "watched"})
 _WATCHED_ATTRS = ("data-watched", "data-seen")
 _TRUTHY = frozenset({"1", "true", "yes"})
 
-# Selectors that prove a page really is a series page (used to rule out
-# error pages that are served with HTTP 200).
-_SEASON_NAV_SELECTORS: dict[str, tuple[str, ...]] = {
+# XPath expressions that prove a page really is a series page (used to rule
+# out error pages that are served with HTTP 200). These are literal
+# translations of the CSS selectors the BeautifulSoup version used.
+_SEASON_NAV_XPATHS: dict[str, tuple[str, ...]] = {
     "aniworld": (
-        "#stream ul li a[href*='/staffel-']",
-        "#stream ul li a[href*='/filme']",
+        ".//*[@id='stream']//ul//li//a[contains(@href, '/staffel-')]",
+        ".//*[@id='stream']//ul//li//a[contains(@href, '/filme')]",
     ),
     "sto": (
-        "#season-nav a[data-season-pill]",
-        '#season-nav a[href*="/staffel-"]',
+        ".//*[@id='season-nav']//a[@data-season-pill]",
+        ".//*[@id='season-nav']//a[contains(@href, '/staffel-')]",
     ),
-    "bs": ("#seasons a",),
+    "bs": (".//*[@id='seasons']//a",),
 }
 
-# Selectors that prove the session is authenticated, per family.
+# XPath expressions that prove the session is authenticated, per family.
 _LOGIN_MARKERS: dict[str, str] = {
-    "aniworld": "div.avatar a[href*='/user/profil/']",
-    "sto": "form[action='/logout']",
-    "bs": "section.navigation a[href='logout']",
+    "aniworld": f".//div[{_hc('avatar')}]//a[contains(@href, '/user/profil/')]",
+    "sto": ".//form[@action='/logout']",
+    "bs": f".//section[{_hc('navigation')}]//a[@href='logout']",
 }
 
 
@@ -109,12 +139,12 @@ class ControlMissingError(RuntimeError):
 
 # ==================== SMALL HELPERS ====================
 def _attr_str(value: object) -> str | None:
-    """Return a BeautifulSoup attribute value if it is a plain string."""
+    """Return an attribute value if it is a plain string."""
     return value if isinstance(value, str) else None
 
 
 def _attr_int(value: object) -> int | None:
-    """Return an int parsed from a BeautifulSoup attribute value."""
+    """Return an int parsed from an attribute value."""
     if isinstance(value, (str, int)):
         try:
             return int(value)
@@ -123,22 +153,58 @@ def _attr_int(value: object) -> int | None:
     return None
 
 
-# lxml parses these sites' pages ~1.2x faster than the stdlib parser. Verified
-# identical, not assumed: every parser this module runs (error page, title,
-# CSRF, series id, login state, episode counts, subscription state, season
-# discovery) was compared across 165 real captured pages from all three site
-# families with zero mismatches. The fallback keeps watchmaker working where
-# lxml was never installed, at the old speed.
-try:
-    import lxml  # noqa: F401
+def make_doc(html: str) -> lxml.html.HtmlElement | None:
+    """Build the lxml tree for a page, or None if the body is not markup.
 
-    _HTML_PARSER = "lxml"
-except ImportError:  # pragma: no cover - depends on the install
-    _HTML_PARSER = "html.parser"
+    Split out so a caller can run more than one check against a single parse:
+    the tree build is the expensive half of reading a page, and the login
+    check has to look at the same document the episodes came from.
+    """
+    try:
+        # document_fromstring, not fromstring: fromstring returns a bare
+        # fragment root, so markup whose outermost element is the <table>
+        # itself never matches a .//table search and the page reads as a
+        # parse failure. BeautifulSoup always wraps in html/body, and this
+        # has to match it.
+        return lxml.html.document_fromstring(html)
+    except (lxml.etree.ParserError, ValueError):
+        return None
 
 
-def _soup(text: str) -> BeautifulSoup:
-    return BeautifulSoup(text, _HTML_PARSER)
+def _first(doc, xpath):
+    """First node matching `xpath`, or None -- lxml's answer to select_one."""
+    found = doc.xpath(xpath)
+    return found[0] if found else None
+
+
+def _spaced_text(el) -> str:
+    """lxml equivalent of BeautifulSoup's get_text(" ", strip=True).
+
+    The separator is the whole point: joining with nothing glues "Harry
+    Potter<small>Specials</small>" into one word, which then survives every
+    later cleanup and is stored as the series title.
+    """
+    return " ".join(t.strip() for t in el.itertext() if t.strip())
+
+
+def _stripped_text(el) -> str:
+    """lxml equivalent of BeautifulSoup's get_text(strip=True).
+
+    Not the same as text_content().strip(): BeautifulSoup strips *each* text
+    node and joins them with nothing, so a title split across inline markup
+    comes out glued rather than double-spaced.
+    """
+    return "".join(t.strip() for t in el.itertext())
+
+
+def _class_tokens(el) -> list[str]:
+    """The element's class attribute as the token list bs4 used to return.
+
+    Split rather than substring-tested: `"btn-glass-primary" in class_string`
+    would also match `btn-glass-primary-lg`, which is the near-miss that turns
+    into a wrong subscription flag rather than an error.
+    """
+    return str(el.get("class") or "").split()
 
 
 def _is_truthy_attr(value: object) -> bool:
@@ -175,9 +241,9 @@ def _heading_text(el) -> str:
 
     bs.to renders "<h2>Harry Potter<small>Specials</small></h2>". Plain
     get_text(strip=True) glues those into "Harry PotterSpecials"; passing a
-    separator keeps them apart without mutating the shared soup.
+    separator keeps them apart without mutating the shared tree.
     """
-    return " ".join(el.get_text(" ", strip=True).split()) if el else ""
+    return " ".join(_spaced_text(el).split()) if el is not None else ""
 
 
 def _clean_title(text: str) -> str | None:
@@ -209,28 +275,28 @@ def _json_body(response: httpx.Response) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def _check_error_page(soup: BeautifulSoup, family: str) -> str | None:
+def _check_error_page(doc, family: str) -> str | None:
     """Detect 404/502/etc. pages served with HTTP 200."""
     # If the page still has real season navigation, it is not an error page.
-    for selector in _SEASON_NAV_SELECTORS.get(family, ()):
-        if soup.select_one(selector):
+    for xpath in _SEASON_NAV_XPATHS.get(family, ()):
+        if _first(doc, xpath) is not None:
             return None
 
-    title_tag = soup.find("title")
-    if title_tag:
-        m = _ERROR_TITLE_RE.search(title_tag.get_text(strip=True))
+    title_tag = _first(doc, ".//title")
+    if title_tag is not None:
+        m = _ERROR_TITLE_RE.search(_stripped_text(title_tag))
         if m:
             return m.group("code") or m.group("code2")
 
-    h2 = soup.find("h2")
-    if h2:
-        code = h2.get_text(strip=True)
+    h2 = _first(doc, ".//h2")
+    if h2 is not None:
+        code = _stripped_text(h2)
         if code.isdigit() and len(code) == 3:
             return code
 
     # s.to / aniworld specific 404 body
-    p = soup.find("p")
-    if p and "nicht gefunden" in p.get_text(strip=True).lower():
+    p = _first(doc, ".//p")
+    if p is not None and "nicht gefunden" in _stripped_text(p).lower():
         return "404"
 
     return None
@@ -407,7 +473,7 @@ def _looks_like_login_page(html: str) -> bool:
     return bool(_PASSWORD_INPUT_RE.search(html) or _LOGIN_FORM_RE.search(html))
 
 
-async def check_host(client: httpx.AsyncClient, host: str) -> tuple[bool, str]:
+async def check_host(client: _AsyncGetClient, host: str) -> tuple[bool, str]:
     """Is this host usable, not merely answering?
 
     This used to HEAD the homepage and accept any status under 400, which a
@@ -736,19 +802,21 @@ class DomainWorker:
 
         raise last_err or RuntimeError(f"{method} {url} failed after {_MAX_RETRIES} attempts")
 
-    async def _get_soup(self, url: str) -> BeautifulSoup:
+    async def _get_soup(self, url: str) -> lxml.html.HtmlElement:
         """Fetch a page and parse it exactly once.
 
-        Everything downstream takes the parsed soup, so a season page costs one
+        Everything downstream takes the parsed tree, so a season page costs one
         parse instead of the four it used to (error check, csrf, control lookup,
         episode count).
         """
         r = await self._request("GET", url)
-        soup = _soup(r.text)
-        code = _check_error_page(soup, self.family)
+        doc = make_doc(r.text)
+        if doc is None:
+            raise RuntimeError(f"unparseable page for {url}")
+        code = _check_error_page(doc, self.family)
         if code:
             raise RuntimeError(f"error page {code} for {url}")
-        return soup
+        return doc
 
     async def _post(
         self,
@@ -769,53 +837,58 @@ class DomainWorker:
 
     # ---------- page parsing ----------
     @staticmethod
-    def _extract_title(soup: BeautifulSoup, family: str) -> str | None:
+    def _extract_title(doc, family: str) -> str | None:
         """Extract series title from a series page using scraper-style fallbacks.
 
         Ordered by how clean the source is: the dedicated headings first, the
         page <h2> next (bs.to's only real title, as "<name> Staffel N"), and
         og:title last because there it carries the whole site suffix.
         """
-        selectors = ("h1[itemprop='name'] > span", "h1.fw-bold") if family == "aniworld" else ("h1.fw-bold",)
-        for selector in selectors:
-            title = _clean_title(_heading_text(soup.select_one(selector)))
+        xpaths = (
+            (".//h1[@itemprop='name']/span", f".//h1[{_hc('fw-bold')}]")
+            if family == "aniworld"
+            else (f".//h1[{_hc('fw-bold')}]",)
+        )
+        for xpath in xpaths:
+            el = _first(doc, xpath)
+            title = _clean_title(_heading_text(el))
             if title:
                 return title
 
-        title = _clean_title(_heading_text(soup.find("h2")))
+        title = _clean_title(_heading_text(_first(doc, ".//h2")))
         if title:
             return title
 
-        og = soup.find("meta", attrs={"property": "og:title"})
-        if og:
+        og = _first(doc, ".//meta[@property='og:title']")
+        if og is not None:
             title = _clean_title(_attr_str(og.get("content")) or "")
             if title:
                 return title
         return None
 
     @staticmethod
-    def _extract_csrf_token(soup: BeautifulSoup) -> str | None:
-        meta = soup.find("meta", attrs={"name": "csrf-token"})
-        if meta:
+    def _extract_csrf_token(doc) -> str | None:
+        meta = _first(doc, ".//meta[@name='csrf-token']")
+        if meta is not None:
             token = _attr_str(meta.get("content"))
             if token:
                 return token
-        for inp in soup.find_all("input", attrs={"name": "_token", "value": True}):
+        for inp in doc.xpath(".//input[@name='_token'][@value]"):
             return _attr_str(inp.get("value"))
         return None
 
     @staticmethod
-    def _extract_series_id(soup: BeautifulSoup) -> str | None:
-        container = soup.select_one("div.add-series")
-        return _attr_str(container.get("data-series-id")) if container else None
+    def _extract_series_id(doc) -> str | None:
+        container = _first(doc, f".//div[{_hc('add-series')}]")
+        return _attr_str(container.get("data-series-id")) if container is not None else None
 
-    def _is_logged_in(self, soup: BeautifulSoup) -> bool:
+    def _is_logged_in(self, doc) -> bool:
         marker = _LOGIN_MARKERS.get(self.family)
-        if marker and soup.select_one(marker):
+        if marker and _first(doc, marker) is not None:
             return True
         # bs.to uses a relative `href="logout"`, which some layouts render
         # outside section.navigation.
-        return self.family == "bs" and soup.find("a", href="logout") is not None
+        return self.family == "bs" and _first(doc, ".//a[@href='logout']") is not None
 
     # ---------- authentication ----------
     async def login(self) -> bool:
@@ -837,8 +910,8 @@ class DomainWorker:
         soup = await self._get_soup(login_url)
 
         if self.family == "bs":
-            token_input = soup.find("input", {"name": "security_token"})
-            token = (_attr_str(token_input.get("value")) if token_input else "") or ""
+            token_input = _first(soup, ".//input[@name='security_token']")
+            token = (_attr_str(token_input.get("value")) if token_input is not None else "") or ""
             if not token:
                 logger.warning("CSRF security_token not found on login page for %s", self.host)
             r = await self._post(
@@ -861,9 +934,9 @@ class DomainWorker:
 
         # aniworld + s.to family
         payload: dict[str, str] = {}
-        form = soup.find("form")
-        if form:
-            for inp in form.find_all("input", attrs={"name": True}):
+        form = _first(soup, ".//form")
+        if form is not None:
+            for inp in form.xpath(".//input[@name]"):
                 name = _attr_str(inp.get("name"))
                 if name:
                     payload[name] = _attr_str(inp.get("value")) or ""
@@ -874,8 +947,8 @@ class DomainWorker:
         token = payload.get("_token") or payload.get("security_token", "")
         if not token:
             for name in ("_token", "security_token"):
-                inp = soup.find("input", {"name": name, "value": True})
-                if inp:
+                inp = _first(soup, f".//input[@name='{name}'][@value]")
+                if inp is not None:
                     token = _attr_str(inp.get("value")) or ""
                     break
         if token:
@@ -918,7 +991,7 @@ class DomainWorker:
             return f"{self.base}/serie/{slug}/staffel-{season}"
         return f"{self.base}/serie/{slug}/{season}"
 
-    def discover_seasons(self, soup: BeautifulSoup, slug: str) -> list[int | str]:
+    def discover_seasons(self, doc, slug: str) -> list[int | str]:
         """List every season of a series from its already-fetched page.
 
         Each fallback runs only when the tier above it found nothing. Running
@@ -930,7 +1003,9 @@ class DomainWorker:
 
         if self.family == "aniworld":
             has_movies = False
-            for a in soup.select("#stream ul:first-of-type li a"):
+            # `:first-of-type` becomes `not(preceding-sibling::ul)`: CSS means
+            # "first sibling of its type", not "first in the document".
+            for a in doc.xpath(".//*[@id='stream']//ul[not(preceding-sibling::ul)]//li//a"):
                 href = _attr_str(a.get("href")) or ""
                 if not href:
                     continue
@@ -941,7 +1016,7 @@ class DomainWorker:
                     has_movies = True
 
             if not seasons:
-                for a in soup.find_all("a", href=True):
+                for a in doc.xpath(".//a[@href]"):
                     href = _attr_str(a.get("href"))
                     if not href or "/anime/stream/" not in href:
                         continue
@@ -952,39 +1027,39 @@ class DomainWorker:
                         has_movies = True
 
             if not seasons:
-                seasons |= self._season_ids_from_attrs(soup)
+                seasons |= self._season_ids_from_attrs(doc)
 
             result: list[int | str] = sorted(seasons)
             if has_movies:
                 result.append(MOVIES_SEASON)
 
         elif self.family == "bs":
-            for a in soup.select("#seasons a"):
+            for a in doc.xpath(".//*[@id='seasons']//a"):
                 href = (_attr_str(a.get("href")) or "").split("?")[0].split("#")[0]
                 parts = href.strip("/").split("/")
                 if len(parts) >= 3 and parts[0] == "serie":
                     with contextlib.suppress(ValueError, IndexError):
                         seasons.add(int(parts[2]))
             if not seasons:
-                for opt in soup.find_all("option", value=True):
+                for opt in doc.xpath(".//option[@value]"):
                     opt_value = _attr_str(opt.get("value"))
                     if opt_value and opt_value.isdigit():
                         seasons.add(int(opt_value))
             result = sorted(seasons)
 
         else:  # sto
-            for link in soup.select("#season-nav a[data-season-pill]"):
+            for link in doc.xpath(".//*[@id='season-nav']//a[@data-season-pill]"):
                 season_num = _attr_str(link.get("data-season-pill"))
                 if season_num and season_num.isdigit():
                     seasons.add(int(season_num))
             if not seasons:
                 staffel_re = re.compile(rf"/serie/{re.escape(slug)}/staffel-(\d+)")
-                for a in soup.find_all("a", href=True):
+                for a in doc.xpath(".//a[@href]"):
                     m = staffel_re.search(_attr_str(a.get("href")) or "")
                     if m:
                         seasons.add(int(m.group(1)))
             if not seasons:
-                seasons |= self._season_ids_from_attrs(soup)
+                seasons |= self._season_ids_from_attrs(doc)
             result = sorted(seasons)
 
         if not result:
@@ -993,14 +1068,10 @@ class DomainWorker:
         return result
 
     @staticmethod
-    def _season_ids_from_attrs(soup: BeautifulSoup) -> set[int]:
-        """Last-resort season numbers from data-season-id attributes.
-
-        Must use select(): find_all("[data-season-id]") looks for a *tag* with
-        that literal name and always matches nothing.
-        """
+    def _season_ids_from_attrs(doc) -> set[int]:
+        """Last-resort season numbers from data-season-id attributes."""
         found: set[int] = set()
-        for el in soup.select("[data-season-id]"):
+        for el in doc.xpath(".//*[@data-season-id]"):
             season_id = _attr_int(el.get("data-season-id"))
             if season_id is not None:
                 found.add(season_id)
@@ -1008,49 +1079,49 @@ class DomainWorker:
 
     @staticmethod
     def _row_is_watched(row) -> bool:
-        if set(row.get("class") or []) & _WATCHED_CLASS_TOKENS:
+        if set(_class_tokens(row)) & _WATCHED_CLASS_TOKENS:
             return True
         return any(_is_truthy_attr(row.get(attr)) for attr in _WATCHED_ATTRS)
 
-    def _count_episodes(self, soup: BeautifulSoup) -> tuple[int, int]:
+    def _count_episodes(self, doc) -> tuple[int, int]:
         """Return (watched_count, total_count) for a season page."""
         if self.family == "aniworld":
-            rows = soup.select("table.seasonEpisodesList tbody tr[data-episode-id]") or soup.select(
-                "tr[data-episode-id]"
+            rows = doc.xpath(f".//table[{_hc('seasonEpisodesList')}]//tbody//tr[@data-episode-id]") or doc.xpath(
+                ".//tr[@data-episode-id]"
             )
         else:  # bs and sto share the same episode table markup
             rows = (
-                soup.select(".episode-table tbody tr.episode-row")
-                or soup.select("tr.episode-row")
-                or soup.select(".episode-row")
+                doc.xpath(f".//*[{_hc('episode-table')}]//tbody//tr[{_hc('episode-row')}]")
+                or doc.xpath(f".//tr[{_hc('episode-row')}]")
+                or doc.xpath(f".//*[{_hc('episode-row')}]")
             )
             if not rows:
-                table = soup.select_one("table.episodes")
-                if table:
-                    rows = [r for r in table.select("tr") if r.find_all("td")]
+                table = _first(doc, f".//table[{_hc('episodes')}]")
+                if table is not None:
+                    rows = [r for r in table.xpath(".//tr") if r.xpath(".//td")]
 
         return sum(1 for row in rows if self._row_is_watched(row)), len(rows)
 
-    def _detect_subscription_status(self, soup: BeautifulSoup) -> tuple[bool | None, bool | None]:
+    def _detect_subscription_status(self, doc) -> tuple[bool | None, bool | None]:
         """Return (subscribed, watchlist) for aniworld/s.to families."""
         if self.family not in SUBSCRIBE_FAMILIES:
             return None, None
 
         if self.family == "aniworld":
-            container = soup.select_one("div.add-series")
-            if container:
+            container = _first(doc, f".//div[{_hc('add-series')}]")
+            if container is not None:
                 return (
                     _attr_str(container.get("data-series-favourite")) == "1",
                     _attr_str(container.get("data-series-watchlist")) == "1",
                 )
             return (
-                soup.select_one("li.setFavourite.buttonAction.true") is not None,
-                soup.select_one("li.setWatchlist.buttonAction.true") is not None,
+                _first(doc, f".//li[{_hc('setFavourite')}][{_hc('buttonAction')}][{_hc('true')}]") is not None,
+                _first(doc, f".//li[{_hc('setWatchlist')}][{_hc('buttonAction')}][{_hc('true')}]") is not None,
             )
 
         subscribed: bool | None = None
         watchlist: bool | None = None
-        for button in self._sto_action_buttons(soup):
+        for button in self._sto_action_buttons(doc):
             data_type = _attr_str(button.get("data-type"))
             if data_type == "favorite":
                 subscribed = self._sto_button_active(button)
@@ -1059,26 +1130,28 @@ class DomainWorker:
         return subscribed, watchlist
 
     @staticmethod
-    def _sto_action_buttons(soup: BeautifulSoup) -> list:
-        return soup.select(".d-none.d-md-flex .js-action-btn") or soup.select(".js-action-btn")
+    def _sto_action_buttons(doc) -> list:
+        return doc.xpath(f".//*[{_hc('d-none')}][{_hc('d-md-flex')}]//*[{_hc('js-action-btn')}]") or doc.xpath(
+            f".//*[{_hc('js-action-btn')}]"
+        )
 
     @staticmethod
     def _sto_button_active(button) -> bool:
-        return "btn-glass-primary" in (button.get("class") or []) or button.get("data-active") == "1"
+        return "btn-glass-primary" in _class_tokens(button) or button.get("data-active") == "1"
 
     # ---------- actions ----------
-    async def ensure_subscribed(self, url: str, soup: BeautifulSoup) -> bool:
+    async def ensure_subscribed(self, url: str, doc) -> bool:
         """Subscribe to a series if the control is present and not already active."""
         if self.family not in SUBSCRIBE_FAMILIES:
             return True
 
-        subscribed, _ = self._detect_subscription_status(soup)
+        subscribed, _ = self._detect_subscription_status(doc)
         if subscribed:
             logger.info("Already subscribed: %s", url)
             return True
 
         if self.family == "aniworld":
-            series_id = self._extract_series_id(soup)
+            series_id = self._extract_series_id(doc)
             if not series_id:
                 logger.warning("No series-id found for subscribe on %s", url)
                 return False
@@ -1092,11 +1165,11 @@ class DomainWorker:
 
         # sto
         sub_url = None
-        for button in self._sto_action_buttons(soup):
+        for button in self._sto_action_buttons(doc):
             if button.get("data-type") == "favorite":
                 sub_url = _attr_str(button.get("data-url"))
                 break
-        token = self._extract_csrf_token(soup)
+        token = self._extract_csrf_token(doc)
         if not sub_url:
             logger.warning("No favorite toggle URL found for %s", url)
             return False
@@ -1110,9 +1183,7 @@ class DomainWorker:
             return False
         return True
 
-    async def _issue_mark(
-        self, soup: BeautifulSoup, season_url: str, slug: str, season: int | str, action: str
-    ) -> None:
+    async def _issue_mark(self, doc, season_url: str, slug: str, season: int | str, action: str) -> None:
         """Send the site's native 'mark whole season' request.
 
         Raises ControlMissingError when a required control/token is absent so the
@@ -1120,16 +1191,16 @@ class DomainWorker:
         """
         if self.family == "aniworld":
             season_id = None
-            clear_all = soup.find("span", class_="clearAllEpisodesFromThisSeason")
-            if clear_all:
+            clear_all = _first(doc, f".//span[{_hc('clearAllEpisodesFromThisSeason')}]")
+            if clear_all is not None:
                 season_id = _attr_str(clear_all.get("data-season-id"))
-            if not season_id and isinstance(season, int) and season in self._season_ids_from_attrs(soup):
+            if not season_id and isinstance(season, int) and season in self._season_ids_from_attrs(doc):
                 # Any element on this season page whose data-season-id matches.
                 season_id = str(season)
             if not season_id:
                 raise ControlMissingError(f"No season-id found for {slug} s{season}")
 
-            series_id = self._extract_series_id(soup)
+            series_id = self._extract_series_id(doc)
             if not series_id:
                 raise ControlMissingError(f"No series-id found for {slug} s{season}")
 
@@ -1152,9 +1223,9 @@ class DomainWorker:
             await self._get_soup(f"{self.base}/serie/{slug}/{season}/des/{verb}")
 
         else:  # sto
-            ctrl = soup.select_one("#season-mark")
-            mark_path = _attr_str(ctrl.get("data-mark-url")) if ctrl else None
-            token = self._extract_csrf_token(soup)
+            ctrl = _first(doc, ".//*[@id='season-mark']")
+            mark_path = _attr_str(ctrl.get("data-mark-url")) if ctrl is not None else None
+            token = self._extract_csrf_token(doc)
             if not mark_path:
                 raise ControlMissingError(f"No #season-mark control for {slug} s{season}")
             if not token:

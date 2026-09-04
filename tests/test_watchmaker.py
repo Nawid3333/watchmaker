@@ -19,7 +19,6 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import httpx  # noqa: E402
-from bs4 import BeautifulSoup  # noqa: E402
 
 import main  # noqa: E402
 
@@ -50,8 +49,8 @@ from main import (  # noqa: E402
 )
 
 
-def soup(html: str) -> BeautifulSoup:
-    return BeautifulSoup(html, "html.parser")
+def soup(html: str):
+    return main.make_doc(html)
 
 
 class TempFileCase(unittest.TestCase):
@@ -558,24 +557,29 @@ class TestSeasonUrls(unittest.TestCase):
 
 
 # ==================== Host reachability ====================
-class _FakeResponse:
+class _FakeResponse(httpx.Response):
     def __init__(self, status_code: int = 200, text: str = "") -> None:
-        self.status_code = status_code
-        self.text = text
+        super().__init__(
+            status_code=status_code,
+            text=text,
+            request=httpx.Request("GET", "https://example.com/"),
+        )
 
 
 class _FakeClient:
     """Stands in for httpx.AsyncClient and records what was fetched."""
 
-    def __init__(self, response=None, exc=None) -> None:
+    def __init__(self, response: httpx.Response | None = None, exc: Exception | None = None) -> None:
         self._response = response
         self._exc = exc
         self.requested: list[str] = []
 
-    async def get(self, url, **kwargs):
+    async def get(self, url: str, **kwargs) -> httpx.Response:
         self.requested.append(str(url))
         if self._exc is not None:
             raise self._exc
+        if self._response is None:
+            raise RuntimeError("_FakeClient.get called with no response configured")
         return self._response
 
 
