@@ -34,7 +34,7 @@ ENV/
 logs/
 
 # Local data
-data/*
+data
 .env
 # IDE
 .vscode/
