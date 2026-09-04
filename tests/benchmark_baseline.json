@@ -1,9 +1,0 @@
-{
-  "classify_batch_lines/2000_urls": 0.0004539000219665468,
-  "classify_url/single": 0.0023347999958787113,
-  "count_episodes/24_rows": 0.0008110000053420663,
-  "discover_seasons/12_seasons": 0.00041920001967810094,
-  "load_url_batches/2000_urls": 0.005697100015822798,
-  "rewrite_batch_urls/2000_urls": 0.0006310000026132911,
-  "soup/200_row_season_page": 0.0037520999903790653
-}

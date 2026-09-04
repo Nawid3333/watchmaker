@@ -41,6 +41,7 @@ data/*
 .idea/
 
 series_urls.txt
+tests/benchmark_baseline.json
 
 # Coverage output (pytest --cov)
 .coverage
