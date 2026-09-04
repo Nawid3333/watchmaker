@@ -23,6 +23,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from bs4 import BeautifulSoup
 
+import term
 from config import (
     CREDENTIALS,
     DEFAULT_BATCH_FILE,
@@ -37,6 +38,8 @@ from config import (
     USER_AGENT,
     ensure_env_file,
 )
+from term import cinput as input
+from term import cprint as print
 
 logger = logging.getLogger("watchmaker")
 # Keep importing this module silent; setup_logging() installs the real handlers.
@@ -258,12 +261,14 @@ def setup_logging(verbose: bool = False) -> None:
     fmt = "%(asctime)s | %(levelname)-8s | %(message)s"
 
     if verbose:
+        # Only the console is coloured; the file handler below keeps the plain
+        # formatter so escape codes never reach the log on disk.
         console = logging.StreamHandler(sys.stdout)
-        console.setFormatter(logging.Formatter(fmt))
+        console.setFormatter(term.ColorFormatter(fmt))
         logger.addHandler(console)
 
     fh = logging.FileHandler(LOG_FILE, encoding="utf-8", mode="a")
-    fh.setFormatter(logging.Formatter(fmt))
+    fh.setFormatter(term.PlainFormatter(fmt))
     logger.addHandler(fh)
 
 
@@ -1724,14 +1729,21 @@ def _print_table(headers: list[str], rows: list[list[str]], caps: list[int], ind
     print((indent + gap.join(h.ljust(w) for h, w in zip(headers, widths, strict=True))).rstrip())
     print(indent + gap.join("─" * w for w in widths))
     for row in rows:
-        print((indent + gap.join(_trunc(c, w).ljust(w) for c, w in zip(row, widths, strict=True))).rstrip())
+        # Fit first, colour second, pad last: the column widths are measured on
+        # plain text, and padding outside the escape codes keeps rstrip() able
+        # to see the trailing spaces it is meant to remove.
+        cells = []
+        for cell, width in zip(row, widths, strict=True):
+            fitted = _trunc(cell, width)
+            cells.append(term.paint(fitted) + " " * (width - len(fitted)))
+        print((indent + gap.join(cells)).rstrip())
     print("─" * (len(indent) + sum(widths) + len(gap) * (len(widths) - 1)))
 
 
 def print_banner() -> None:
-    print("=" * 56)
-    print("  watchmaker  —  batch mark series")
-    print("=" * 56)
+    print(term.style("=" * 56, term._T.CYAN))
+    print(term.step("  watchmaker  —  batch mark series"))
+    print(term.style("=" * 56, term._T.CYAN))
 
 
 def print_menu(
@@ -1749,7 +1761,7 @@ def print_menu(
         print("  default batch file is empty.")
         print("  use option 5 to add a URL or switch batch files.")
 
-    print("\n  hosts:")
+    print("\n  " + term.step("hosts:"))
     if statuses:
         term_w = _term_width()
         rows = []
@@ -1774,11 +1786,19 @@ def print_menu(
     print("    0  exit")
 
 
-def ask_yes_no(prompt: str, default: bool = False) -> bool:
+def ask_yes_no(prompt: str, default: bool = False, danger: bool = False) -> bool:
     # Show which answer Enter picks, so the default is never a surprise.
     suffix = " [Y/n]: " if default else " [y/N]: "
+    if danger:
+        # Colour the question but not the leading newlines, so the escape
+        # codes stay on the line the reader is actually looking at.
+        question = prompt.lstrip("\n ")
+        lead = prompt[: len(prompt) - len(question)]
+        text = lead + term.danger(question) + term.dim(suffix)
+    else:
+        text = prompt + suffix
     while True:
-        choice = input(prompt + suffix).strip().lower()
+        choice = input(text).strip().lower()
         if not choice:
             return default
         if choice in ("y", "yes"):
@@ -1815,9 +1835,9 @@ def print_batch_summary(
 
 
 def _print_run_summary(report: RunReport, results: list[SeriesResult]) -> None:
-    print("\n" + "=" * 56)
-    print("  RUN SUMMARY")
-    print("=" * 56)
+    print("\n" + term.style("=" * 56, term._T.CYAN))
+    print(term.step("  RUN SUMMARY"))
+    print(term.style("=" * 56, term._T.CYAN))
 
     if results:
         col = _term_width() // 3
@@ -1963,7 +1983,7 @@ async def _preview(
 async def run_action(action: str, grouped: dict[str, list[str]], rejected: list[dict]) -> None:
     missing = validate_credentials_for_batch(grouped)
     if missing:
-        print("\n  ✗ missing credentials for:", ", ".join(missing))
+        print("\n  " + term.danger("✗ missing credentials for: " + ", ".join(missing)))
         print("  please fill in watchmaker/.env")
         return
 
@@ -2145,7 +2165,7 @@ async def clear_temporary_urls(urls_file: str) -> None:
     print(f"  file: {urls_file}")
 
     if not kept:
-        print("\n  ⚠ nothing is protected, so everything in this file counts as temporary.")
+        print("\n  " + term.alert("⚠ nothing is protected, so everything in this file counts as temporary."))
         print("    to protect a group of entries, add this line above them:")
         print(f"      {KEEP_MARKER}")
         print(f"    or protect a single entry by putting '{PERMANENT_PREFIX}' directly before its URL:")
@@ -2162,7 +2182,7 @@ async def clear_temporary_urls(urls_file: str) -> None:
         print(f"      ... and {len(doomed) - 15} more")
     print(f"\n  {len(kept)} permanent entrie(s) will be kept.")
 
-    if not ask_yes_no("\n  remove them?", default=False):
+    if not ask_yes_no("\n  remove them?", default=False, danger=True):
         print("  cancelled.")
         return
 
@@ -2235,7 +2255,7 @@ async def _detect_and_add_input(urls_file: str) -> str:
         if (
             urls_file != DEFAULT_BATCH_FILE
             and _batch_has_urls(DEFAULT_BATCH_FILE)
-            and not ask_yes_no(f"  overwrite {DEFAULT_BATCH_FILE}?", default=False)
+            and not ask_yes_no(f"  overwrite {DEFAULT_BATCH_FILE}?", default=False, danger=True)
         ):
             print("  cancelled.")
             return urls_file
