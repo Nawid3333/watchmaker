@@ -420,7 +420,7 @@ class FakeWorker(DomainWorker):
     async def _get_soup(self, url):
         return soup(self.pages.pop(0))
 
-    async def _issue_mark(self, soup, season_url, slug, season, action):
+    async def _issue_mark(self, doc, season_url, slug, season, action):
         self.marks.append((slug, season, action))
         if self.mark_effect:
             self.mark_effect()
@@ -502,7 +502,7 @@ class TestMarkSeason(unittest.IsolatedAsyncioTestCase):
         calls = {"n": 0}
 
         class Expiring(FakeWorker):
-            async def _issue_mark(self, soup, season_url, slug, season, action):
+            async def _issue_mark(self, doc, season_url, slug, season, action):
                 calls["n"] += 1
                 if calls["n"] == 1:
                     raise main.ControlMissingError("No CSRF token")
@@ -518,7 +518,7 @@ class TestMarkSeason(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_control_on_a_valid_session_is_not_retried(self):
         class Missing(FakeWorker):
-            async def _issue_mark(self, soup, season_url, slug, season, action):
+            async def _issue_mark(self, doc, season_url, slug, season, action):
                 raise main.ControlMissingError("No #season-mark control")
 
             async def _recover_session(self):
@@ -815,7 +815,7 @@ class LoginRecordingWorker(DomainWorker):
         self.fetched.append(url)
         return soup(self.login_page if url.endswith("/login") else self.verify_page)
 
-    async def _post(self, url, **kwargs):
+    async def _post(self, url, data=None, *, json=None, headers=None):
         return _FakeResponse(200, "")
 
 
