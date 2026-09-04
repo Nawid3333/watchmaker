@@ -197,9 +197,7 @@ class TestImportUrls:
         assert "not found" in printed
 
     def test_comments_in_a_scraper_list_are_skipped(self, tmp_path, exports):
-        exports["sto"].write_text(
-            "# a note\nhttps://serienstream.to/serie/real  # trailing note\n", encoding="utf-8"
-        )
+        exports["sto"].write_text("# a note\nhttps://serienstream.to/serie/real  # trailing note\n", encoding="utf-8")
         batch = tmp_path / "batch.txt"
         batch.write_text("", encoding="utf-8")
         with _captured(), _answers("y", default="y"):
@@ -222,9 +220,7 @@ class TestPrintedSummaries:
 
     def test_a_long_host_list_is_truncated_with_a_count(self, tmp_path):
         path = tmp_path / "many.txt"
-        path.write_text(
-            "".join(f"https://serienstream.to/serie/show-{n}\n" for n in range(25)), encoding="utf-8"
-        )
+        path.write_text("".join(f"https://serienstream.to/serie/show-{n}\n" for n in range(25)), encoding="utf-8")
         grouped, _ = wm.load_url_batches(str(path))
         with _captured() as out:
             wm.print_batch_summary(grouped, max_urls_per_host=5)
