@@ -1812,9 +1812,9 @@ def _print_table(headers: list[str], rows: list[list[str]], caps: list[int], ind
 
 
 def print_banner() -> None:
-    print(term.style("=" * 56, term._T.CYAN))
+    print(term.accent("=" * 56))
     print(term.step("  watchmaker  —  batch mark series"))
-    print(term.style("=" * 56, term._T.CYAN))
+    print(term.accent("=" * 56))
 
 
 def print_menu(
@@ -1906,9 +1906,9 @@ def print_batch_summary(
 
 
 def _print_run_summary(report: RunReport, results: list[SeriesResult]) -> None:
-    print("\n" + term.style("=" * 56, term._T.CYAN))
+    print("\n" + term.accent("=" * 56))
     print(term.step("  RUN SUMMARY"))
-    print(term.style("=" * 56, term._T.CYAN))
+    print(term.accent("=" * 56))
 
     if results:
         col = _term_width() // 3
