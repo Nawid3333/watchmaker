@@ -1682,6 +1682,26 @@ def _batch_section_counts(path: str) -> tuple[int, int]:
     return entries.count(False), entries.count(True)
 
 
+def _permanent_by_url(path: str) -> dict[str, bool]:
+    """Map each entry line's URL (as load_url_batches stores it) to whether it's permanent.
+
+    Mirrors load_url_batches' own stripping so the keys line up with what ends
+    up in its ``grouped`` dict: whitespace trimmed, then the leading '-' tag
+    removed if present.
+    """
+    lines = _read_lines(path)
+    flags = _classify_batch_lines(lines)
+    result: dict[str, bool] = {}
+    for raw, is_permanent in zip(lines, flags, strict=True):
+        line = raw.strip()
+        if not _is_entry_line(line):
+            continue
+        if line.startswith(PERMANENT_PREFIX):
+            line = line[len(PERMANENT_PREFIX) :].strip()
+        result[line] = is_permanent
+    return result
+
+
 def _rewrite_batch_urls(path: str, mapping: dict[str, str]) -> bool:
     """Swap migrated URLs in place, keeping comments and unknown lines.
 
@@ -1884,8 +1904,14 @@ def print_batch_summary(
     action: str = "",
     rejected: list[dict] | None = None,
     header: str = "",
-    max_urls_per_host: int = 10,
+    permanent: dict[str, bool] | None = None,
 ) -> None:
+    """Print every URL, grouped by host and, when ``permanent`` is given, by
+    temporary/permanent within each host.
+
+    Nothing is truncated: a batch is meant to be looked over before it's
+    acted on, so hiding entries behind an "... and N more" would defeat that.
+    """
     total = sum(len(urls) for urls in grouped.values())
     verb = action.lower() if action else "process"
     if header:
@@ -1894,14 +1920,23 @@ def print_batch_summary(
     for host, urls in sorted(grouped.items()):
         family = SUPPORTED_DOMAINS.get(host, "?")
         print(f"      • {host} ({family}): {len(urls)}")
-        for url in urls[:max_urls_per_host]:
-            print(f"          {url}")
-        remaining = len(urls) - max_urls_per_host
-        if remaining > 0:
-            print(f"          ... and {remaining} more")
+        if permanent is None:
+            for url in urls:
+                print(f"          {url}")
+            continue
+        temporary_urls = [url for url in urls if not permanent.get(url, False)]
+        permanent_urls = [url for url in urls if permanent.get(url, False)]
+        if temporary_urls:
+            print(f"          temporary ({len(temporary_urls)}):")
+            for url in temporary_urls:
+                print(f"              {url}")
+        if permanent_urls:
+            print(f"          permanent ({len(permanent_urls)}):")
+            for url in permanent_urls:
+                print(f"              {url}")
     if rejected:
         print(f"    ⚠ skipped {len(rejected)} unsupported URL(s):")
-        for item in rejected[:max_urls_per_host]:
+        for item in rejected:
             print(f"          {item['line']}  ({item['reason']})")
 
 
@@ -2357,7 +2392,9 @@ async def main() -> None:
     batch = load_url_batches(urls_file)
     initial_grouped, rejected = batch
     print_banner()
-    print_batch_summary(initial_grouped, header="loaded batch", rejected=rejected)
+    print_batch_summary(
+        initial_grouped, header="loaded batch", rejected=rejected, permanent=_permanent_by_url(urls_file)
+    )
 
     print("\n  → checking hosts ...")
     resolved, host_statuses, active_host_by_family = await resolve_active_hosts(urls_file, preloaded=batch)

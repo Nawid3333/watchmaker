@@ -218,13 +218,33 @@ class TestPrintedSummaries:
         assert "3 series" in printed
         assert "serienstream.to" in printed
 
-    def test_a_long_host_list_is_truncated_with_a_count(self, tmp_path):
+    def test_a_long_host_list_is_shown_in_full(self, tmp_path):
         path = tmp_path / "many.txt"
         path.write_text("".join(f"https://serienstream.to/serie/show-{n}\n" for n in range(25)), encoding="utf-8")
         grouped, _ = wm.load_url_batches(str(path))
         with _captured() as out:
-            wm.print_batch_summary(grouped, max_urls_per_host=5)
-        assert "and 20 more" in out.getvalue()
+            wm.print_batch_summary(grouped)
+        printed = out.getvalue()
+        assert "more" not in printed
+        for n in range(25):
+            assert f"show-{n}" in printed
+
+    def test_the_batch_summary_splits_temporary_and_permanent_per_host(self, tmp_path):
+        path = tmp_path / "mixed.txt"
+        path.write_text(
+            "https://serienstream.to/serie/temp-show\n"
+            "-https://serienstream.to/serie/pinned-show\n"
+            "https://aniworld.to/anime/stream/ani-show\n",
+            encoding="utf-8",
+        )
+        grouped, _ = wm.load_url_batches(str(path))
+        with _captured() as out:
+            wm.print_batch_summary(grouped, permanent=wm._permanent_by_url(str(path)))
+        printed = out.getvalue()
+        assert "temporary (1)" in printed
+        assert "permanent (1)" in printed
+        assert "temp-show" in printed
+        assert "pinned-show" in printed
 
     def test_rejected_lines_are_reported_with_their_reason(self, tmp_path):
         path = tmp_path / "bad.txt"
