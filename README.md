@@ -163,6 +163,26 @@ python -m unittest discover -s tests
 
 Covers URL classification, batch-file rewriting, season discovery, episode counting, title extraction, and the mark/verify logic. No extra dependencies.
 
+### Monthly site check
+
+`.github/workflows/site-check.yml` runs `tests/site_check.py` on the 3rd of
+every month. It runs watchmaker's own host probe and page readers against all
+three live sites. If one of them would fail, it opens an issue labelled
+`site-check`, and the first passing run closes it again. A site that blocks
+GitHub's runners is reported as unreachable, not as a change. Run it yourself
+any time:
+
+```bash
+python tests/site_check.py
+```
+
+Without credentials it checks each login form and one public series and season
+page per site. With a site's credentials (read from your `.env` locally, or
+set as repository secrets for the workflow) it also logs in to that site and
+looks for the controls a mark would use, through a worker that has no way to
+send anything. It never changes anything, and its report holds no account
+details.
+
 ### Changing the batch on the fly (option 5)
 
 While the program is running, select **5** to:
@@ -229,6 +249,7 @@ WATCHMAKER_STO_URLS=/path/to/S.to HTTPX scraper/series_urls.txt
 ├── main.py                  # Entry point & interactive menu
 ├── requirements.txt         # Python dependencies
 └── tests/
+    ├── site_check.py        # Monthly live-site check (see Tests)
     └── test_watchmaker.py   # Unit tests
 ```
 
