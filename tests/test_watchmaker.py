@@ -138,6 +138,25 @@ class TestBatchLoading(TempFileCase):
         grouped, _ = load_url_batches(path)
         self.assertEqual(grouped["serienstream.to"], ["https://serienstream.to/serie/alpha"])
 
+    def test_one_series_spelled_two_ways_is_collapsed(self):
+        # A URL copied from the address bar arrives decoded, one from a scraper
+        # list percent-encoded. The scrapers' slug_key folds the two into one
+        # slug, so this has to as well.
+        path = self.write(
+            "b.txt",
+            "https://serienstream.to/serie/25%20Years%20of%20You\nhttps://serienstream.to/serie/25 years of you\n",
+        )
+        grouped, _ = load_url_batches(path)
+        self.assertEqual(grouped["serienstream.to"], ["https://serienstream.to/serie/25%20Years%20of%20You"])
+
+    def test_different_series_are_not_collapsed(self):
+        path = self.write(
+            "b.txt",
+            "https://serienstream.to/serie/waldern\nhttps://serienstream.to/serie/wldern\n",
+        )
+        grouped, _ = load_url_batches(path)
+        self.assertEqual(len(grouped["serienstream.to"]), 2)
+
     def test_hosts_come_back_in_domain_order(self):
         path = self.write(
             "b.txt",

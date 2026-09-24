@@ -19,7 +19,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
 import lxml.etree
@@ -372,6 +372,16 @@ def classify_url(url: str) -> tuple[str, str, str] | None:
     return (host, family, m.group(1))
 
 
+def series_key(host: str, slug: str) -> tuple[str, str]:
+    """Return the key that says two batch URLs name the same series.
+
+    Case and percent-encoding are folded, matching the scrapers' slug_key: the
+    sites print "/serie/25%20Years%20of%20You" in one list and
+    "/serie/25%20years%20of%20you" in another, and both lists feed this batch.
+    """
+    return host, " ".join(unquote(slug).split()).lower()
+
+
 def slug_for(url: str, family: str) -> str:
     """Return the series slug of a URL.
 
@@ -430,7 +440,7 @@ def load_url_batches(source: str) -> tuple[dict[str, list[str]], list[dict]]:
             continue
 
         host, _family, slug = classification
-        key = (host, slug.lower())
+        key = series_key(host, slug)
         if key in seen_series:
             duplicates += 1
             logger.info("Skipping duplicate series URL %s", line)
@@ -599,7 +609,7 @@ async def resolve_active_hosts(
         unique: list[str] = []
         for url in resolved[host]:
             classification = classify_url(url)
-            key = (classification[0], classification[2].lower()) if classification else ("", url)
+            key = series_key(classification[0], classification[2]) if classification else ("", url)
             if key in seen_series:
                 logger.info("Skipping duplicate series URL after mirror migration: %s", url)
                 continue
@@ -2227,7 +2237,7 @@ async def import_urls(urls_file: str) -> None:
     # string, so /serie/x and /serie/x/staffel-2 are not both imported.
     grouped, _ = load_url_batches(urls_file)
     existing_keys = {
-        (c[0], c[2].lower()) for urls in grouped.values() for url in urls if (c := classify_url(url)) is not None
+        series_key(c[0], c[2]) for urls in grouped.values() for url in urls if (c := classify_url(url)) is not None
     }
 
     added_by_family: dict[str, int] = {}
@@ -2237,7 +2247,7 @@ async def import_urls(urls_file: str) -> None:
             classification = classify_url(url)
             if classification is None:
                 continue
-            key = (classification[0], classification[2].lower())
+            key = series_key(classification[0], classification[2])
             if key in existing_keys:
                 continue
             existing_keys.add(key)
