@@ -123,7 +123,6 @@ jobs:
       issues: write
       actions: read
     with:
-      image-check: true
       linux-runner: ${{ needs.detect.outputs.latest-linux }}
       windows-runner: ${{ needs.detect.outputs.latest-windows }}
 
@@ -139,7 +138,6 @@ jobs:
       issues: write
       actions: read
     with:
-      image-check: true
       linux-runner: ${{ needs.detect.outputs.next-linux }}
       windows-runner: ${{ needs.detect.outputs.next-windows }}
 
