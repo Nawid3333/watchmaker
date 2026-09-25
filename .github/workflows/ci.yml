@@ -19,14 +19,30 @@ on:
   # feature branch before opening a PR. Only a push to main can lead to a
   # release: auto-release.yml checks the triggering event.
   workflow_dispatch:
+  # runner-images.yml runs this suite on a new runner image, before and after
+  # windows-latest moves to it. Only the test job runs then: the audit and the
+  # weekly-check issue belong to the weekly schedule.
+  workflow_call:
+    inputs:
+      image-check:
+        type: boolean
+        default: false
+      linux-runner:
+        type: string
+        default: ubuntu-latest
+      windows-runner:
+        type: string
+        default: windows-latest
 
 # A newer push to the same branch or PR makes the older run pointless, so it
 # is cancelled instead of finishing on a Windows runner. On main that is
 # safe for releases too: auto-release.yml skips the cancelled run, and the run
 # for the newer commit releases every commit since the last tag.
-# Per event as well, so a scheduled run and a push never cancel each other.
+# Per event as well, so a scheduled run and a push never cancel each other,
+# and per workflow and image, so a run from runner-images.yml (which names the
+# caller as github.workflow) never cancels a CI run or another image's run.
 concurrency:
-  group: ci-${{ github.ref }}-${{ github.event_name }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ inputs.windows-runner }}
   cancel-in-progress: true
 
 permissions:
@@ -46,7 +62,7 @@ jobs:
     # Matches release.yml: windows-latest is the only platform this suite has
     # been run on, so keeping CI on the same runner means a green CI run
     # actually predicts a green release build.
-    runs-on: windows-latest
+    runs-on: ${{ inputs.windows-runner || 'windows-latest' }}
     # A test that hangs on a network call would otherwise hold the runner for
     # GitHub's 6-hour default. The whole job normally takes a few minutes.
     timeout-minutes: 20
@@ -86,7 +102,7 @@ jobs:
   # each against the PyPI advisory database. Weekly and by hand only: a new
   # advisory is news, but it should not block releasing an unrelated fix.
   audit:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && !inputs.image-check
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -107,7 +123,7 @@ jobs:
   # an @mention so it is emailed, closed by the first green scheduled run.
   report:
     needs: [test, audit]
-    if: always() && github.event_name == 'schedule'
+    if: always() && github.event_name == 'schedule' && !inputs.image-check
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
