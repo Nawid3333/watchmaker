@@ -173,3 +173,16 @@ def _resolve_export_path(path: str | None) -> str | None:
 
 
 SERIES_URLS_EXPORTS = {family: _resolve_export_path(path) for family, path in SERIES_URLS_EXPORTS.items()}
+
+
+# ==================== SCRAPER IGNORED SEASONS ====================
+# Some seasons carry an "episode 0" placeholder that the site reports as
+# marked but never shows as watched afterwards. Each scraper records those
+# (slug, season) pairs in its data/.ignored_seasons.json and leaves episode 0
+# out of its counts; watchmaker reads the same files so it does not fail
+# verifying a mark that cannot stick. Found next to each family's scraper
+# list, so overriding WATCHMAKER_<FAMILY>_URLS moves this along with it.
+IGNORED_SEASONS_FILES: dict[str, str | None] = {
+    family: os.path.join(os.path.dirname(path), "data", ".ignored_seasons.json") if path else None
+    for family, path in SERIES_URLS_EXPORTS.items()
+}

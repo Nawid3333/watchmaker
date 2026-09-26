@@ -49,6 +49,21 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip)
 
 
+@pytest.fixture(autouse=True)
+def _isolated_site_state(monkeypatch):
+    """Keep every test off state that outlives it.
+
+    The sibling scrapers' real .ignored_seasons.json files would make a test's
+    outcome depend on this machine's data, and the per-family POST windows are
+    module-level, so POSTs from earlier tests would make a later one sleep out
+    a real 61-second window.
+    """
+    import main
+
+    monkeypatch.setattr(main, "IGNORED_SEASONS_FILES", dict.fromkeys(main.IGNORED_SEASONS_FILES))
+    monkeypatch.setattr(main, "_POST_WINDOWS", {})
+
+
 @pytest.fixture(scope="session")
 def bench(request):
     """Session-wide timing recorder; see tests/bench.py for the contract."""

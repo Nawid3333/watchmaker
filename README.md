@@ -139,7 +139,7 @@ Everything else — no marker below it, no `-` in front of it — is temporary.
 
 - **Option 7** clears temporary entries — URLs only. Your own comments and blank lines are left alone, and it shows you exactly what will go before asking.
 - Adding URLs (option 5, or importing with option 4) inserts them **above** the marker, untagged, so new series always land in the working list.
-- Retrying failed URLs (option 6) and pasting a single URL (option 5) replace the temporary entries only; the keep block and any `-`-tagged line are left alone.
+- Retrying failed URLs (option 6), and pasting a single URL with option 5 when you choose to overwrite, replace the temporary entries only; the keep block and any `-`-tagged line are left alone.
 - Permanent does **not** mean skipped: both kinds of permanent entries are still marked by options 1 and 2 like any other. Neither one controls anything but what option 7 removes.
 
 The marker is a comment, so a batch file using neither mechanism still works exactly as before — everything in it simply counts as temporary. It's matched loosely (`# KEEP …`, any spacing, casing, or number of `=`), because it is meant to be edited by hand.
@@ -154,6 +154,8 @@ A season counts as successful only when the episode page, re-read after the requ
 - `✓` is action-aware: a fully _unwatched_ series is a success at 0 watched episodes.
 - If a session expires mid-batch, watchmaker re-authenticates once and retries that season before giving up.
 - A retired or mistyped slug is answered by these sites with the catalogue page at `HTTP 200`. Such a page is rejected by name (`Alle Serien`, `Andere Serien`, ...) instead of being marked as if it were a real series.
+- Some seasons carry an **episode 0** placeholder that the site accepts a mark for and then never shows as watched. Seasons listed in a scraper's `data/.ignored_seasons.json` (found next to the `SERIES_URLS_EXPORTS` file for that family) have episode 0 left out of the count, exactly as the scraper does; a season holding nothing but that placeholder is skipped. If an unlisted episode 0 is the only thing that did not stick, the failure says so and the log gives the entry to add.
+- s.to accepts 30 POSTs (season marks and subscribes together) per minute per account, then refuses every POST until the minute is up. watchmaker spaces its s.to POSTs to stay under that, and waits out a whole window on a `429` rather than retrying into it.
 
 ## Tests
 
@@ -187,7 +189,7 @@ details.
 
 While the program is running, select **5** to:
 
-- Paste a single URL → replaces the temporary entries with that URL, keeping the keep block and any `-`-tagged line.
+- Paste a single URL → if the batch already has temporary entries, you are asked whether to **add** the URL to them (`a`) or **overwrite** them with it (`o`); Enter cancels. Either way the keep block and any `-`-tagged line stay. Adding a series that is already in the batch, on any mirror or season, changes nothing.
 - Enter a file path → switches the current batch to that file.
 
 ### Importing URLs from scraper lists (option 4)

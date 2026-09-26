@@ -16,7 +16,11 @@ import re
 import shutil
 import sys
 import tempfile
+import time
+from collections import deque
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import unquote, urljoin, urlparse
@@ -32,6 +36,7 @@ from config import (
     DOMAIN_ORDER,
     FAILED_URLS_FILE,
     HTTP_REQUEST_TIMEOUT,
+    IGNORED_SEASONS_FILES,
     LOG_FILE,
     LOGS_DIR,
     RETRY_BATCH_FILE,
@@ -81,6 +86,18 @@ _BASE_BACKOFF = 1.0
 _MAX_BACKOFF = 30.0
 _RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
 _OK_POST_STATUS = frozenset({200, 201, 204, 301, 302})
+
+# s.to accepts 30 POSTs per account per 60 s -- season marks and subscribes
+# together -- then answers 429, with no Retry-After, to every POST until the
+# window is over. GETs are not limited. Measured from the 2026-08-30 and
+# 2026-09-26 runs: the 31st POST in a window was the first refused both times.
+# A few under the limit over a slightly longer window leaves room for clock
+# drift and for the same account being used in a browser meanwhile.
+_POST_RATE_LIMITS: dict[str, tuple[int, float]] = {"sto": (25, 61.0)}
+# How long a 429 without a usable Retry-After is waited out. A per-minute
+# window never resets within the one or two seconds ordinary backoff gives it,
+# so every retry landed in the same window and the mark failed anyway.
+_RATE_LIMIT_WAIT = 61.0
 
 ACTION_WATCHED = "watched"
 ACTION_UNWATCHED = "unwatched"
@@ -379,7 +396,38 @@ def series_key(host: str, slug: str) -> tuple[str, str]:
     sites print "/serie/25%20Years%20of%20You" in one list and
     "/serie/25%20years%20of%20you" in another, and both lists feed this batch.
     """
-    return host, " ".join(unquote(slug).split()).lower()
+    return host, slug_key(slug)
+
+
+def slug_key(slug: str) -> str:
+    """Fold a slug the way the scrapers' slug_key does, so their files match ours."""
+    return " ".join(unquote(slug.strip()).strip("/").split()).lower()
+
+
+def load_ignored_seasons(family: str) -> frozenset[tuple[str, str]]:
+    """Return the (slug key, season) pairs whose episode 0 the family's scraper ignores.
+
+    Read from the scraper's own .ignored_seasons.json rather than a copy here,
+    so a season added to or cleared from it there is picked up on the next run
+    without the two lists drifting apart. A missing or unreadable file means
+    nothing is ignored, which is the old behaviour.
+    """
+    path = IGNORED_SEASONS_FILES.get(family)
+    if not path or not os.path.exists(path):
+        return frozenset()
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Could not read ignored seasons from %s: %s", path, exc)
+        return frozenset()
+    if not isinstance(data, list):
+        return frozenset()
+    return frozenset(
+        (slug_key(entry["slug"]), str(entry.get("season", "")))
+        for entry in data
+        if isinstance(entry, dict) and isinstance(entry.get("slug"), str) and entry["slug"].strip()
+    )
 
 
 def slug_for(url: str, family: str) -> str:
@@ -637,6 +685,9 @@ class SeasonOutcome:
     watched_after: int = 0
     ok: bool = True
     note: str = ""
+    # The season's only episode is an ignored episode 0: total is 0 because
+    # there is nothing to mark, not because the page could not be read.
+    placeholder_only: bool = False
 
     def target(self, action: str) -> int:
         if action == ACTION_WATCHED:
@@ -734,6 +785,69 @@ def _tri_state(value: bool | None) -> str:
     return "✓" if value else "✗" if value is False else "?"
 
 
+def _retry_after_seconds(value: str | None) -> float | None:
+    """Seconds a Retry-After header asks for, in either of its two forms."""
+    if not value:
+        return None
+    value = value.strip()
+    with contextlib.suppress(ValueError):
+        return max(float(value), 0.0)
+    with contextlib.suppress(TypeError, ValueError, IndexError):
+        when = parsedate_to_datetime(value)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=UTC)
+        return max((when - datetime.now(UTC)).total_seconds(), 0.0)
+    return None
+
+
+class _RateWindow:
+    """Allow at most ``limit`` events in any ``period``-second span.
+
+    A sliding window over our own send times. It also keeps us inside a
+    server's fixed window that starts at whatever request came first, since
+    any such window lies within one of ours.
+    """
+
+    def __init__(self, limit: int, period: float):
+        self.limit = limit
+        self.period = period
+        self._sent: deque[float] = deque()
+
+    async def acquire(self) -> float:
+        """Wait for a free slot and take it; return how long that took.
+
+        There is no await between the check and the append, so two tasks
+        sharing one window can never both take the last slot.
+        """
+        waited = 0.0
+        while True:
+            now = time.monotonic()
+            while self._sent and now - self._sent[0] >= self.period:
+                self._sent.popleft()
+            if len(self._sent) < self.limit:
+                self._sent.append(now)
+                return waited
+            pause = self.period - (now - self._sent[0])
+            waited += pause
+            await asyncio.sleep(pause)
+
+
+# One window per site family, shared by every worker in the process: the
+# limit belongs to the account, and the preview, the marking pass and a
+# retry straight after all spend from it.
+_POST_WINDOWS: dict[str, _RateWindow] = {}
+
+
+def _post_window(family: str) -> _RateWindow | None:
+    limits = _POST_RATE_LIMITS.get(family)
+    if limits is None:
+        return None
+    window = _POST_WINDOWS.get(family)
+    if window is None:
+        window = _POST_WINDOWS[family] = _RateWindow(*limits)
+    return window
+
+
 # ==================== DOMAIN WORKER ====================
 class DomainWorker:
     def __init__(self, host: str):
@@ -745,6 +859,7 @@ class DomainWorker:
         self.creds = CREDENTIALS.get(self.family, {})
         self.client: httpx.AsyncClient | None = None
         self.logged_in = False
+        self._ignored_seasons: frozenset[tuple[str, str]] | None = None
 
     @property
     def base(self) -> str:
@@ -764,12 +879,25 @@ class DomainWorker:
             await self.client.aclose()
 
     # ---------- transport ----------
-    async def _backoff(self, attempt: int, method: str, url: str, reason: str, retry_after: str | None = None) -> None:
+    async def _backoff(
+        self,
+        attempt: int,
+        method: str,
+        url: str,
+        reason: str,
+        retry_after: str | None = None,
+        rate_limited: bool = False,
+    ) -> None:
         wait = min(_BASE_BACKOFF * (2 ** (attempt - 1)), _MAX_BACKOFF)
-        if retry_after:
+        asked = _retry_after_seconds(retry_after)
+        if rate_limited:
+            # A 429 means a window has to run out, not that the server needs a
+            # moment. Honour its own figure when it gives one, else wait out a
+            # whole window.
+            wait = min(asked, _RATE_LIMIT_WAIT) if asked is not None else _RATE_LIMIT_WAIT
+        elif asked is not None:
             # Honour the server's own pacing when it asks for more than ours.
-            with contextlib.suppress(ValueError):
-                wait = min(max(float(retry_after), wait), _MAX_BACKOFF)
+            wait = min(max(asked, wait), _MAX_BACKOFF)
         logger.warning(
             "%s %s -> %s, retrying in %.1fs (attempt %d/%d)",
             method,
@@ -786,8 +914,13 @@ class DomainWorker:
         if self.client is None:
             raise RuntimeError("DomainWorker client not initialized")
 
+        window = _post_window(self.family) if method == "POST" else None
         last_err: Exception | None = None
         for attempt in range(1, _MAX_RETRIES + 1):
+            if window is not None:
+                waited = await window.acquire()
+                if waited >= 1:
+                    logger.info("Paced %s %s by %.1fs to stay under the site's POST limit", method, url, waited)
             try:
                 r = await self.client.request(method, url, **kwargs)
             except httpx.RequestError as exc:
@@ -804,6 +937,7 @@ class DomainWorker:
                     url,
                     str(r.status_code),
                     retry_after=r.headers.get("Retry-After"),
+                    rate_limited=r.status_code == 429,
                 )
                 continue
 
@@ -1093,8 +1227,45 @@ class DomainWorker:
             return True
         return any(_is_truthy_attr(row.get(attr)) for attr in _WATCHED_ATTRS)
 
-    def _count_episodes(self, doc) -> tuple[int, int]:
-        """Return (watched_count, total_count) for a season page."""
+    def _episode_number(self, row) -> int | None:
+        """The episode number a row stands for, read the way its scraper reads it.
+
+        None when the row does not say, which is never mistaken for 0.
+        """
+        if self.family == "aniworld":
+            values = row.xpath(".//meta[@itemprop='episodeNumber']/@content")
+            text = str(values[0]).strip() if values else ""
+        else:
+            cell = _first(row, f".//th[{_hc('episode-number-cell')}]")
+            text = _stripped_text(cell) if cell is not None else ""
+        if not text:
+            text = (_attr_str(row.get("data-episode-season-id")) or "").strip()
+        if not text and self.family != "aniworld":
+            cell = _first(row, ".//td")
+            text = _stripped_text(cell) if cell is not None else ""
+        try:
+            return int(text)
+        except ValueError:
+            return None
+
+    def ignores_episode_zero(self, slug: str, season: int | str) -> bool:
+        """True when this family's scraper has episode 0 of this season on its ignore list."""
+        if self._ignored_seasons is None:
+            self._ignored_seasons = load_ignored_seasons(self.family)
+        return (slug_key(slug), str(season)) in self._ignored_seasons
+
+    def _count_episodes(self, doc, skip_episode_zero: bool = False) -> tuple[int, int]:
+        """Return (watched_count, total_count) for a season page.
+
+        ``skip_episode_zero`` leaves out an episode 0 row: a placeholder the
+        site accepts a mark for and then never shows as watched.
+        """
+        rows = self._episode_rows(doc)
+        if skip_episode_zero:
+            rows = [row for row in rows if self._episode_number(row) != 0]
+        return sum(1 for row in rows if self._row_is_watched(row)), len(rows)
+
+    def _episode_rows(self, doc) -> list:
         if self.family == "aniworld":
             rows = doc.xpath(f".//table[{_hc('seasonEpisodesList')}]//tbody//tr[@data-episode-id]") or doc.xpath(
                 ".//tr[@data-episode-id]"
@@ -1109,8 +1280,7 @@ class DomainWorker:
                 table = _first(doc, f".//table[{_hc('episodes')}]")
                 if table is not None:
                     rows = [r for r in table.xpath(".//tr") if r.xpath(".//td")]
-
-        return sum(1 for row in rows if self._row_is_watched(row)), len(rows)
+        return rows
 
     def _detect_subscription_status(self, doc) -> tuple[bool | None, bool | None]:
         """Return (subscribed, watchlist) for aniworld/s.to families."""
@@ -1265,10 +1435,20 @@ class DomainWorker:
             logger.exception("Could not load season %s of %s: %s", season, slug, exc)
             return SeasonOutcome(season=season, ok=False, note=f"load failed: {exc}")
 
-        before, total = self._count_episodes(soup)
+        skip_zero = self.ignores_episode_zero(slug, season)
+        before, total = self._count_episodes(soup, skip_zero)
         outcome.total = total
         outcome.watched_before = before
         outcome.watched_after = before
+
+        if total == 0 and skip_zero and self._count_episodes(soup)[1]:
+            # Nothing here but the ignored placeholder: no mark would change
+            # anything, and spending one of s.to's rationed POSTs on it every
+            # run is how it used to fail.
+            outcome.note = "only episode 0, which is ignored"
+            outcome.placeholder_only = True
+            logger.info("Skipping %s season %s: its only episode is the ignored episode 0", slug, season)
+            return outcome
 
         if total == 0:
             # No episode rows parsed means we cannot mark or verify anything.
@@ -1301,12 +1481,13 @@ class DomainWorker:
         # for an issued one alike. An HTTP 200 from these sites does not prove
         # the state actually changed.
         try:
-            after, after_total = self._count_episodes(await self._get_soup(season_url))
+            after_doc = await self._get_soup(season_url)
         except Exception as exc:  # noqa: BLE001
             outcome.ok = False
             outcome.note = f"unverified: {exc}"
             logger.error("Could not verify season %s of %s: %s", season, slug, exc)
             return outcome
+        after, after_total = self._count_episodes(after_doc, skip_zero)
 
         if after_total and after_total != total:
             logger.warning(
@@ -1331,7 +1512,24 @@ class DomainWorker:
                 outcome.total,
                 target,
             )
+            if action == ACTION_WATCHED and self._only_episode_zero_unwatched(after_doc):
+                # The placeholder case the scrapers keep a list for, not yet
+                # on it. Name the fix rather than leave a bare count mismatch.
+                outcome.note += "; episode 0 will not stay watched"
+                logger.error(
+                    "Only episode 0 of %s season %s stayed unwatched. If it is a placeholder, add"
+                    ' {"slug": "%s", "season": "%s"} to %s',
+                    slug,
+                    season,
+                    slug,
+                    season,
+                    IGNORED_SEASONS_FILES.get(self.family) or "the scraper's .ignored_seasons.json",
+                )
         return outcome
+
+    def _only_episode_zero_unwatched(self, doc) -> bool:
+        unwatched = [self._episode_number(row) for row in self._episode_rows(doc) if not self._row_is_watched(row)]
+        return bool(unwatched) and all(number == 0 for number in unwatched)
 
     async def inspect_series(self, url: str, action: str) -> tuple[SeriesResult, SeriesPlan]:
         """Read current state without changing anything (the preview pass).
@@ -1354,8 +1552,10 @@ class DomainWorker:
 
         for season in seasons:
             season_soup = await self._get_soup(self.season_url(slug, season))
-            before, total = self._count_episodes(season_soup)
+            skip_zero = self.ignores_episode_zero(slug, season)
+            before, total = self._count_episodes(season_soup, skip_zero)
             outcome = SeasonOutcome(season=season, total=total, watched_before=before, watched_after=before)
+            outcome.placeholder_only = total == 0 and skip_zero and self._count_episodes(season_soup)[1] > 0
             # watched_after holds the *planned* state so the preview can render
             # "12/24 → 24/24"; the marking pass overwrites it with reality.
             outcome.watched_after = outcome.target(action)
@@ -2051,7 +2251,7 @@ async def _preview(
 
                 needs_sub = action == ACTION_WATCHED and worker.needs_subscribe and result.subscribed is False
                 needs_episodes = any(s.watched_before != s.target(action) for s in result.seasons)
-                unreadable = any(s.total == 0 for s in result.seasons)
+                unreadable = any(s.total == 0 and not s.placeholder_only for s in result.seasons)
 
                 sub_badge = " ⚡" if needs_sub else ""
                 counter = f"{result.watched_before}/{result.total_episodes}"
@@ -2351,11 +2551,48 @@ async def retry_failed_urls(urls_file: str) -> str:
     return RETRY_BATCH_FILE
 
 
+def _ask_add_or_overwrite(temporary_count: int, permanent_count: int) -> str | None:
+    """Ask whether a pasted URL joins the working list or replaces it.
+
+    Enter cancels rather than picking either: one of the two throws the
+    current list away, so neither is a safe thing to do on a stray keypress.
+    """
+    kept = f"; the {permanent_count} permanent entrie(s) stay either way" if permanent_count else ""
+    print(f"\n  the batch already has {temporary_count} temporary URL(s){kept}.")
+    print("    a  add this URL to them")
+    print("    o  overwrite them with this URL")
+    while True:
+        choice = input("  [a/o, Enter cancels]: ").strip().lower()
+        if not choice:
+            return None
+        if choice in ("a", "add"):
+            return "add"
+        if choice in ("o", "overwrite"):
+            return "overwrite"
+        print("  please answer a or o.")
+
+
+def _batch_entry_for_series(path: str, classification: tuple[str, str, str]) -> str | None:
+    """The batch line already naming this series, on whichever mirror, if any."""
+    _host, family, slug = classification
+    wanted = (family, slug_key(slug))
+    for line in _read_lines(path):
+        if not _is_entry_line(line):
+            continue
+        url = line.strip()
+        if url.startswith(PERMANENT_PREFIX):
+            url = url[len(PERMANENT_PREFIX) :].strip()
+        other = classify_url(url)
+        if other is not None and (other[1], slug_key(other[2])) == wanted:
+            return url
+    return None
+
+
 async def _detect_and_add_input(urls_file: str) -> str:
     """Scraper-style input: detect URL, existing file path, or file name."""
     print("\n  add link / change batch")
     print(f"  current file: {urls_file}")
-    print("  • Paste URL      → writes single URL to default batch")
+    print("  • Paste URL      → adds it to, or overwrites, the default batch's temporary URLs")
     print("  • Enter path     → switches to that batch file")
     print("  • Press Enter    → cancel\n")
 
@@ -2365,20 +2602,29 @@ async def _detect_and_add_input(urls_file: str) -> str:
         return urls_file
 
     if user_input.startswith(("http://", "https://")):
-        if classify_url(user_input) is None:
+        classification = classify_url(user_input)
+        if classification is None:
             print(f"  ✗ not a supported series URL: {user_input}")
             return urls_file
-        if (
-            urls_file != DEFAULT_BATCH_FILE
-            and _batch_has_urls(DEFAULT_BATCH_FILE)
-            and not ask_yes_no(f"  overwrite {DEFAULT_BATCH_FILE}?", default=False, danger=True)
-        ):
-            print("  cancelled.")
-            return urls_file
-        # Replaces the working list only. This used to truncate the whole
-        # file, which would take permanent entries with it.
-        _replace_batch_urls(DEFAULT_BATCH_FILE, [user_input])
-        print(f"  wrote 1 URL → {DEFAULT_BATCH_FILE}")
+        temporary_count, permanent_count = _batch_section_counts(DEFAULT_BATCH_FILE)
+        mode = "add"
+        if temporary_count:
+            mode = _ask_add_or_overwrite(temporary_count, permanent_count)
+            if mode is None:
+                print("  cancelled.")
+                return urls_file
+        if mode == "add":
+            existing = _batch_entry_for_series(DEFAULT_BATCH_FILE, classification)
+            if existing:
+                print(f"  already in the batch: {existing}")
+                return DEFAULT_BATCH_FILE
+            _append_batch_urls(DEFAULT_BATCH_FILE, [user_input])
+            print(f"  added 1 URL → {DEFAULT_BATCH_FILE} ({temporary_count + 1} temporary)")
+        else:
+            # Replaces the working list only. This used to truncate the whole
+            # file, which would take permanent entries with it.
+            _replace_batch_urls(DEFAULT_BATCH_FILE, [user_input])
+            print(f"  replaced {temporary_count} temporary URL(s) with 1 → {DEFAULT_BATCH_FILE}")
         return DEFAULT_BATCH_FILE
 
     candidate = user_input

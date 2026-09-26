@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import sys
 import unittest
+from datetime import timedelta
+from email.utils import format_datetime
 from pathlib import Path
+from unittest import mock
 
 import httpx
 
@@ -166,6 +169,119 @@ class TestMarkSeries(unittest.IsolatedAsyncioTestCase):
         await w.mark_series(_plan("burningseries.ac", "bs"), ACTION_WATCHED)
         self.assertEqual(w.subscribe_calls, 0)
         self.assertEqual(w.seasons_marked, [1, 2])
+
+
+class _Clock:
+    """A fake monotonic clock that asyncio.sleep advances instead of waiting."""
+
+    def __init__(self):
+        self.now = 1000.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+class PacedCase(unittest.IsolatedAsyncioTestCase):
+    """Real _request over a scripted transport, on a fake clock."""
+
+    def setUp(self):
+        self.clock = _Clock()
+        for patcher in (
+            mock.patch.object(main.time, "monotonic", self.clock.monotonic),
+            mock.patch.object(main.asyncio, "sleep", self.clock.sleep),
+            mock.patch.dict(main._POST_WINDOWS, clear=True),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def worker(self, host: str, *statuses: int, headers: dict | None = None) -> DomainWorker:
+        """A worker whose server answers with *statuses* in turn, then 200 for ever."""
+        replies = list(statuses)
+
+        def reply(request: httpx.Request) -> httpx.Response:
+            status = replies.pop(0) if replies else 200
+            return httpx.Response(status, headers=headers if status == 429 else None, json={"ok": True})
+
+        w = DomainWorker(host)
+        w.client = httpx.AsyncClient(transport=httpx.MockTransport(reply))
+        self.addAsyncCleanup(w.client.aclose)
+        return w
+
+
+class TestPostPacing(PacedCase):
+    async def test_sto_posts_stay_under_the_per_minute_limit(self):
+        # The 2026-09-26 run sent 30 POSTs in 15 s; the 31st and everything
+        # after it for the rest of the minute came back 429.
+        limit, period = main._POST_RATE_LIMITS["sto"]
+        w = self.worker("serienstream.to")
+        for _ in range(limit):
+            await w._post("https://serienstream.to/shows/x/season/1/mark")
+        self.assertEqual(self.clock.sleeps, [])
+        await w._post("https://serienstream.to/shows/x/season/2/mark")
+        self.assertEqual(len(self.clock.sleeps), 1)
+        self.assertAlmostEqual(self.clock.sleeps[0], period)
+
+    async def test_the_window_is_shared_by_every_sto_worker(self):
+        # The limit is the account's: the preview's worker and the marking
+        # pass's worker draw on the same allowance.
+        limit, _period = main._POST_RATE_LIMITS["sto"]
+        first, second = self.worker("serienstream.to"), self.worker("serienstream.to")
+        for _ in range(limit):
+            await first._post("https://serienstream.to/shows/x/season/1/mark")
+        await second._post("https://serienstream.to/shows/x/season/1/mark")
+        self.assertEqual(len(self.clock.sleeps), 1)
+
+    async def test_gets_and_other_families_are_not_paced(self):
+        sto, aniworld = self.worker("serienstream.to"), self.worker("aniworld.to")
+        for _ in range(60):
+            await sto._request("GET", "https://serienstream.to/serie/x/staffel-1")
+            await aniworld._post("https://aniworld.to/ajax/watchseason")
+        self.assertEqual(self.clock.sleeps, [])
+
+
+class TestRateLimitRetry(PacedCase):
+    async def test_a_429_is_waited_out_for_a_whole_window(self):
+        # It used to wait 1 s then 2 s: both retries landed in the same window
+        # and the season failed, and so did every one after it that minute.
+        w = self.worker("serienstream.to", 429)
+        r = await w._post("https://serienstream.to/shows/x/season/1/mark")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.clock.sleeps, [main._RATE_LIMIT_WAIT])
+
+    async def test_a_retry_after_from_the_server_is_honoured(self):
+        w = self.worker("serienstream.to", 429, headers={"Retry-After": "7"})
+        await w._post("https://serienstream.to/shows/x/season/1/mark")
+        self.assertEqual(self.clock.sleeps, [7.0])
+
+    async def test_a_429_that_never_clears_still_fails(self):
+        w = self.worker("serienstream.to", 429, 429, 429)
+        with self.assertRaises(httpx.HTTPStatusError):
+            await w._post("https://serienstream.to/shows/x/season/1/mark")
+
+    async def test_a_server_error_keeps_the_short_backoff(self):
+        w = self.worker("serienstream.to", 500)
+        await w._request("GET", "https://serienstream.to/serie/x")
+        self.assertEqual(self.clock.sleeps, [main._BASE_BACKOFF])
+
+
+class TestRetryAfterParsing(unittest.TestCase):
+    def test_seconds_and_http_dates_are_both_understood(self):
+        self.assertEqual(main._retry_after_seconds("12"), 12.0)
+        soon = main.datetime.now(main.UTC) + timedelta(seconds=30)
+        self.assertAlmostEqual(main._retry_after_seconds(format_datetime(soon, usegmt=True)), 30, delta=2)
+
+    def test_nothing_usable_is_none(self):
+        for value in (None, "", "soon", "-"):
+            with self.subTest(value=value):
+                self.assertIsNone(main._retry_after_seconds(value))
+
+    def test_a_date_in_the_past_means_no_wait(self):
+        self.assertEqual(main._retry_after_seconds("Wed, 21 Oct 2015 07:28:00 GMT"), 0.0)
 
 
 if __name__ == "__main__":

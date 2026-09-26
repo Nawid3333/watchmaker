@@ -549,6 +549,104 @@ class TestMarkSeason(unittest.IsolatedAsyncioTestCase):
         self.assertIn("season-mark", outcome.note)
 
 
+# ==================== episode 0 placeholders ====================
+def numbered(*rows):
+    """A season page from (episode number, watched) pairs, in s.to's markup."""
+    cells = "".join(
+        f'<tr class="episode-row{" seen" if seen else ""}"><th class="episode-number-cell">{n}</th></tr>'
+        for n, seen in rows
+    )
+    return f'<table class="episode-table"><tbody>{cells}</tbody></table>'
+
+
+class TestEpisodeZero(unittest.IsolatedAsyncioTestCase):
+    """s.to answers a mark on an episode 0 placeholder with ok, seen, 1/1 --
+    and the page still shows it unwatched. marry-my-husband season 0 failed
+    every run on it (2026-09-26); the S.to scraper already ignores it."""
+
+    def worker(self, pages, ignored=()):
+        w = FakeWorker("serienstream.to", pages)
+        w._ignored_seasons = frozenset(ignored)
+        return w
+
+    def test_counting_can_leave_episode_zero_out(self):
+        w = DomainWorker("serienstream.to")
+        page = soup(numbered((0, False), (1, True), (2, False)))
+        self.assertEqual(w._count_episodes(page), (1, 3))
+        self.assertEqual(w._count_episodes(page, skip_episode_zero=True), (1, 2))
+
+    def test_aniworld_numbers_come_from_the_episode_meta(self):
+        w = DomainWorker("aniworld.to")
+        rows = "".join(
+            f'<tr data-episode-id="{n}"><td><meta itemprop="episodeNumber" content="{n}"></td></tr>' for n in (0, 1)
+        )
+        page = soup(f'<table class="seasonEpisodesList"><tbody>{rows}</tbody></table>')
+        self.assertEqual(w._count_episodes(page, skip_episode_zero=True), (0, 1))
+
+    def test_a_row_without_a_number_is_never_taken_for_episode_zero(self):
+        w = DomainWorker("serienstream.to")
+        self.assertEqual(w._count_episodes(soup(episodes(3, 1)), skip_episode_zero=True), (1, 3))
+
+    async def test_a_season_holding_only_the_ignored_placeholder_is_left_alone(self):
+        w = self.worker([numbered((0, False))], ignored={("marry-my-husband", "0")})
+        outcome = await w.mark_season("marry-my-husband", 0, ACTION_WATCHED)
+        self.assertTrue(outcome.ok)
+        self.assertTrue(outcome.placeholder_only)
+        self.assertEqual(w.marks, [])
+
+    async def test_an_ignored_placeholder_does_not_fail_verification(self):
+        w = self.worker(
+            [numbered((0, False), (1, False)), numbered((0, False), (1, True))],
+            ignored={("x", "1")},
+        )
+        outcome = await w.mark_season("x", 1, ACTION_WATCHED)
+        self.assertTrue(outcome.ok)
+        self.assertEqual((outcome.watched_after, outcome.total), (1, 1))
+
+    async def test_the_ignore_list_is_per_season(self):
+        w = self.worker([numbered((0, False), (1, False)), numbered((0, False), (1, True))], ignored={("x", "2")})
+        outcome = await w.mark_season("x", 1, ACTION_WATCHED)
+        self.assertFalse(outcome.ok)
+
+    async def test_an_unlisted_placeholder_is_named_in_the_failure(self):
+        w = self.worker([numbered((0, False), (1, False)), numbered((0, False), (1, True))])
+        outcome = await w.mark_season("x", 1, ACTION_WATCHED)
+        self.assertFalse(outcome.ok)
+        self.assertIn("episode 0 will not stay watched", outcome.note)
+
+
+class TestLoadIgnoredSeasons(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = os.path.join(self.dir.name, ".ignored_seasons.json")
+        patcher = mock.patch.dict(main.IGNORED_SEASONS_FILES, {"sto": self.path})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_entries_are_read_with_slugs_folded_like_the_scraper_folds_them(self):
+        entries = [{"slug": "Marry%20My-Husband", "season": "0"}, {"slug": "x", "season": 3}, {"season": "1"}]
+        Path(self.path).write_text(json.dumps(entries), encoding="utf-8")
+        self.assertEqual(main.load_ignored_seasons("sto"), {("marry my-husband", "0"), ("x", "3")})
+
+    def test_a_missing_or_broken_file_ignores_nothing(self):
+        self.assertEqual(main.load_ignored_seasons("sto"), frozenset())
+        Path(self.path).write_text("{not json", encoding="utf-8")
+        self.assertEqual(main.load_ignored_seasons("sto"), frozenset())
+
+    def test_a_family_without_a_scraper_ignores_nothing(self):
+        with mock.patch.dict(main.IGNORED_SEASONS_FILES, {"bs": None}):
+            self.assertEqual(main.load_ignored_seasons("bs"), frozenset())
+
+    def test_the_file_sits_in_the_scraper_data_folder_next_to_its_url_list(self):
+        import config
+
+        for family, path in config.IGNORED_SEASONS_FILES.items():
+            export = config.SERIES_URLS_EXPORTS[family]
+            if export:
+                self.assertEqual(path, os.path.join(os.path.dirname(export), "data", ".ignored_seasons.json"))
+
+
 class TestSeasonUrls(unittest.TestCase):
     def test_per_family_url_shapes(self):
         self.assertEqual(
@@ -1462,17 +1560,57 @@ class TestBatchRewritersKeepThePermanentSection(SectionCase, unittest.IsolatedAs
         self.assertEqual(result, self.path)
         self.assertFalse(os.path.exists(retry_path))
 
-    async def test_pasting_a_url_replaces_only_the_working_list(self):
-        self.write("https://old", self.KEEP, "https://serienstream.to/serie/keepme")
-        pasted = "https://serienstream.to/serie/fresh"
+    async def _paste(self, *answers):
         with (
             mock.patch.object(main, "DEFAULT_BATCH_FILE", self.path),
-            mock.patch("builtins.input", return_value=pasted),
+            mock.patch("builtins.input", side_effect=list(answers)),
         ):
-            await main._detect_and_add_input(self.path)
+            return await main._detect_and_add_input(self.path)
+
+    async def test_overwriting_replaces_only_the_working_list(self):
+        self.write("https://old", self.KEEP, "https://serienstream.to/serie/keepme")
+        pasted = "https://serienstream.to/serie/fresh"
+        await self._paste(pasted, "o")
 
         self.assertEqual(self.urls(), [pasted, "https://serienstream.to/serie/keepme"])
         self.assertIn(self.KEEP, self.read())
+
+    async def test_adding_keeps_the_working_list_and_goes_above_the_marker(self):
+        self.write("https://serienstream.to/serie/old", self.KEEP, "https://serienstream.to/serie/keepme")
+        pasted = "https://serienstream.to/serie/fresh"
+        await self._paste(pasted, "a")
+
+        self.assertEqual(
+            self.urls(),
+            ["https://serienstream.to/serie/old", pasted, "https://serienstream.to/serie/keepme"],
+        )
+        self.assertIn(self.KEEP, self.read())
+
+    async def test_adding_a_series_already_in_the_batch_changes_nothing(self):
+        # Same series, other season and other mirror: still the same series.
+        self.write("https://serienstream.to/serie/old/staffel-2", self.KEEP, "https://serienstream.to/serie/keepme")
+        before = self.read()
+        await self._paste("https://serienstream.cx/serie/OLD/staffel-5", "a")
+        self.assertEqual(self.read(), before)
+
+    async def test_enter_at_the_add_or_overwrite_question_cancels(self):
+        self.write("https://serienstream.to/serie/old", self.KEEP, "https://serienstream.to/serie/keepme")
+        before = self.read()
+        result = await self._paste("https://serienstream.to/serie/fresh", "")
+        self.assertEqual(self.read(), before)
+        self.assertEqual(result, self.path)
+
+    async def test_an_unclear_answer_is_asked_again(self):
+        self.write("https://serienstream.to/serie/old")
+        pasted = "https://serienstream.to/serie/fresh"
+        await self._paste(pasted, "x", "a")
+        self.assertEqual(self.urls(), ["https://serienstream.to/serie/old", pasted])
+
+    async def test_with_no_temporary_urls_there_is_nothing_to_ask(self):
+        self.write(self.KEEP, "https://serienstream.to/serie/keepme")
+        pasted = "https://serienstream.to/serie/fresh"
+        await self._paste(pasted)  # a second input() call would raise StopIteration
+        self.assertEqual(self.urls(), [pasted, "https://serienstream.to/serie/keepme"])
 
     async def test_pasting_an_unsupported_url_changes_nothing(self):
         self.write("https://old", self.KEEP, "https://keepme")
