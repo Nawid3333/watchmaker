@@ -186,3 +186,7 @@ IGNORED_SEASONS_FILES: dict[str, str | None] = {
     family: os.path.join(os.path.dirname(path), "data", ".ignored_seasons.json") if path else None
     for family, path in SERIES_URLS_EXPORTS.items()
 }
+# The scrapers that keep such a list. For these a missing file is a warning;
+# the BS.to scraper has none, so there it is expected and only noted. A file
+# that does exist is read either way.
+IGNORE_LIST_FAMILIES = frozenset({"aniworld", "sto"})

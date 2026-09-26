@@ -154,7 +154,11 @@ A season counts as successful only when the episode page, re-read after the requ
 - `✓` is action-aware: a fully _unwatched_ series is a success at 0 watched episodes.
 - If a session expires mid-batch, watchmaker re-authenticates once and retries that season before giving up.
 - A retired or mistyped slug is answered by these sites with the catalogue page at `HTTP 200`. Such a page is rejected by name (`Alle Serien`, `Andere Serien`, ...) instead of being marked as if it were a real series.
-- Some seasons carry an **episode 0** placeholder that the site accepts a mark for and then never shows as watched. Seasons listed in a scraper's `data/.ignored_seasons.json` (found next to the `SERIES_URLS_EXPORTS` file for that family) have episode 0 left out of the count, exactly as the scraper does; a season holding nothing but that placeholder is skipped. If an unlisted episode 0 is the only thing that did not stick, the failure says so and the log gives the entry to add.
+- Some seasons carry an **episode 0** placeholder that the site accepts a mark for and then never shows as watched. Seasons listed in a scraper's `data/.ignored_seasons.json` (found next to the `SERIES_URLS_EXPORTS` file for that family) have episode 0 left out of the count, exactly as the scraper does, so it never decides `✓` or `✗`. It is still marked and re-checked every run, and every episode 0 met is shown in the CLI: in the preview, as `· E0: S1 placeholder` on the result line, and in full in the `EPISODE 0` block of the run summary. That block flags, with the fix to make:
+  - an **unlisted** episode 0 that did not stick (the season fails; the entry to add is printed),
+  - a **listed** episode 0 that now stays watched (the entry may no longer be needed),
+  - a **stale** entry, whose season no longer has an episode 0.
+- Before the preview, each family's ignore list is shown with the file it came from and how many seasons it holds. A list that is missing, unreadable or malformed ignores nothing and is flagged `⚠` there, again right above `proceed with marking?`, and in the run summary. The BS.to scraper keeps no such list, so for bs.to its absence is only noted.
 - s.to accepts 30 POSTs (season marks and subscribes together) per minute per account, then refuses every POST until the minute is up. watchmaker spaces its s.to POSTs to stay under that, and waits out a whole window on a `429` rather than retrying into it.
 
 ## Tests

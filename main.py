@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
@@ -36,6 +36,7 @@ from config import (
     DOMAIN_ORDER,
     FAILED_URLS_FILE,
     HTTP_REQUEST_TIMEOUT,
+    IGNORE_LIST_FAMILIES,
     IGNORED_SEASONS_FILES,
     LOG_FILE,
     LOGS_DIR,
@@ -407,30 +408,70 @@ def slug_key(slug: str) -> str:
     return " ".join(unquote(slug.strip()).strip("/").split()).lower()
 
 
-def load_ignored_seasons(family: str) -> frozenset[tuple[str, str]]:
-    """Return the (slug key, season) pairs whose episode 0 the family's scraper ignores.
+@dataclass(frozen=True)
+class IgnoreList:
+    """One family's episode 0 ignore list, and anything that kept it from being read."""
+
+    family: str
+    path: str | None
+    seasons: frozenset[tuple[str, str]] = frozenset()
+    # Empty when the file was read cleanly; otherwise what went wrong, in
+    # words for the CLI.
+    problem: str = ""
+    # A problem that needs a look, as opposed to one this family always has
+    # (the BS.to scraper keeps no list at all).
+    warning: bool = False
+
+    def status_line(self) -> str:
+        if not self.problem:
+            return f"✓ {self.family:<8}  {len(self.seasons)} season(s)  ← {self.path}"
+        return f"{'⚠' if self.warning else '·'} {self.family:<8}  {self.problem}"
+
+
+def _is_ignore_entry(entry: object) -> bool:
+    return isinstance(entry, dict) and isinstance(entry.get("slug"), str) and bool(entry["slug"].strip())
+
+
+def load_ignore_list(family: str) -> IgnoreList:
+    """Read the (slug key, season) pairs whose episode 0 the family's scraper ignores.
 
     Read from the scraper's own .ignored_seasons.json rather than a copy here,
     so a season added to or cleared from it there is picked up on the next run
-    without the two lists drifting apart. A missing or unreadable file means
-    nothing is ignored, which is the old behaviour.
+    without the two lists drifting apart. A file that cannot be used ignores
+    nothing, and says why in ``problem`` so the CLI can show it: a list that
+    silently went missing would otherwise turn every known placeholder into
+    an unexplained failure.
     """
     path = IGNORED_SEASONS_FILES.get(family)
-    if not path or not os.path.exists(path):
-        return frozenset()
+    expected = family in IGNORE_LIST_FAMILIES
+    if not path:
+        return IgnoreList(
+            family, None, problem="no scraper folder configured — no episode 0 is ignored", warning=expected
+        )
+    if not os.path.exists(path):
+        if expected:
+            return IgnoreList(family, path, problem=f"not found: {path} — no episode 0 is ignored", warning=True)
+        return IgnoreList(family, path, problem="none — its scraper keeps no ignore list, so every episode 0 counts")
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("Could not read ignored seasons from %s: %s", path, exc)
-        return frozenset()
+        return IgnoreList(family, path, problem=f"could not read {path}: {exc} — no episode 0 is ignored", warning=True)
     if not isinstance(data, list):
-        return frozenset()
-    return frozenset(
-        (slug_key(entry["slug"]), str(entry.get("season", "")))
-        for entry in data
-        if isinstance(entry, dict) and isinstance(entry.get("slug"), str) and entry["slug"].strip()
+        return IgnoreList(family, path, problem=f"{path} is not a JSON list — no episode 0 is ignored", warning=True)
+    seasons = frozenset(
+        (slug_key(entry["slug"]), str(entry.get("season", ""))) for entry in data if _is_ignore_entry(entry)
     )
+    skipped = sum(1 for entry in data if not _is_ignore_entry(entry))
+    if skipped:
+        return IgnoreList(
+            family,
+            path,
+            seasons,
+            problem=f"{len(seasons)} season(s) ← {path}; {skipped} entr(y/ies) without a slug skipped",
+            warning=True,
+        )
+    return IgnoreList(family, path, seasons)
 
 
 def slug_for(url: str, family: str) -> str:
@@ -688,9 +729,16 @@ class SeasonOutcome:
     watched_after: int = 0
     ok: bool = True
     note: str = ""
-    # The season's only episode is an ignored episode 0: total is 0 because
-    # there is nothing to mark, not because the page could not be read.
-    placeholder_only: bool = False
+    # Episode 0, which some seasons carry as a placeholder the site accepts a
+    # mark for and then never shows as watched. ``listed``: the scraper's
+    # ignore list names this season, so episode 0 is left out of total and
+    # the counts above. ep0_before/ep0_after: its own watched state, None when
+    # the season has none. Kept apart from the counts so it is still marked,
+    # checked and shown where it does not decide ✓ or ✗. The preview never
+    # marks anything, so there ep0_after is simply ep0_before.
+    listed: bool = False
+    ep0_before: bool | None = None
+    ep0_after: bool | None = None
 
     def target(self, action: str) -> int:
         if action == ACTION_WATCHED:
@@ -698,6 +746,87 @@ class SeasonOutcome:
         if action == ACTION_UNWATCHED:
             return 0
         return self.watched_after
+
+    @property
+    def placeholder_only(self) -> bool:
+        """The season's only episode is an ignored episode 0: total is 0
+        because nothing else is there, not because the page could not be read."""
+        return self.listed and self.total == 0 and self.ep0_before is not None
+
+    def needs_mark(self, action: str) -> bool:
+        """True when a mark could change something, episode 0 included."""
+        if self.watched_before != self.target(action):
+            return True
+        return self.ep0_before is not None and self.ep0_before != (action == ACTION_WATCHED)
+
+    def episode_zero(self, action: str, planned: bool = False) -> EpisodeZeroNote | None:
+        """What to tell the user about this season's episode 0, if anything.
+
+        ``planned`` describes the preview, before anything has been marked.
+        """
+        want = action == ACTION_WATCHED
+        wanted = "watched" if want else "unwatched"
+        if self.listed and self.ep0_before is None:
+            if not self.total:
+                # No episode rows at all: the page was not read, which is
+                # reported as its own failure. It says nothing about the entry,
+                # and calling it stale could get a correct entry removed.
+                return None
+            return EpisodeZeroNote(
+                "stale", True, "on the ignore list, but this season has no episode 0 — the entry looks stale"
+            )
+        state = self.ep0_before if planned else self.ep0_after
+        if state is None:
+            # No episode 0 -- or, after marking, a page that could not be
+            # re-read, which is already the season's own failure note.
+            return None
+        if state == want:
+            if self.listed and want:
+                return EpisodeZeroNote(
+                    "sticks",
+                    True,
+                    "episode 0 is watched although the ignore list names it a placeholder"
+                    " — the entry may no longer be needed",
+                )
+            return None
+        if planned:
+            verb = "marked" if want else "unmarked"
+            if self.listed:
+                return EpisodeZeroNote(
+                    "placeholder",
+                    False,
+                    f"episode 0 is not {wanted} — a known placeholder (ignore list); {verb} anyway and checked",
+                )
+            return EpisodeZeroNote(
+                "unlisted",
+                False,
+                f"episode 0 is not {wanted} and not on the ignore list — counts like any episode, has to stick",
+            )
+        if self.listed:
+            return EpisodeZeroNote(
+                "placeholder",
+                False,
+                f"episode 0 did not stay {wanted} — a known placeholder (ignore list), not counted",
+            )
+        return EpisodeZeroNote(
+            "unlisted", True, f"episode 0 did not stay {wanted} and is not on the ignore list — check it"
+        )
+
+
+# Short forms for one-line output; a kind not named here is its own tag.
+_EP0_TAGS = {"unlisted": "not listed", "stale": "stale entry"}
+
+
+class EpisodeZeroNote(NamedTuple):
+    """One season's episode 0 finding, for the CLI."""
+
+    kind: str  # placeholder, sticks, unlisted or stale
+    attention: bool  # worth investigating, not only worth knowing
+    text: str
+
+    @property
+    def tag(self) -> str:
+        return _EP0_TAGS.get(self.kind, self.kind)
 
 
 @dataclass
@@ -751,14 +880,22 @@ class SeriesResult:
         wl = _tri_state(self.watchlist)
         return f" (Sub:{sub} WL:{wl})"
 
+    def episode_zero_notes(self, planned: bool = False) -> list[tuple[SeasonOutcome, EpisodeZeroNote]]:
+        return [(s, n) for s in self.seasons if (n := s.episode_zero(self.action, planned))]
+
+    def episode_zero_lines(self, planned: bool = False) -> list[str]:
+        """One line per season with something to say about its episode 0."""
+        return [f"{'⚠ ' if n.attention else '▶'}S{s.season} E0: {n.text}" for s, n in self.episode_zero_notes(planned)]
+
     def line(self) -> str:
         status = "✓" if self.ok and self.at_target else "✗"
         display = f"{self.title} ({self.slug})" if self.title else self.slug
         note = f" — {self.note}" if self.note else ""
+        zero = ", ".join(f"S{s.season} {n.tag}" for s, n in self.episode_zero_notes())
         return (
             f"{status} {display} {self.season_summary}: "
             f"{self.watched_episodes}/{self.total_episodes} watched"
-            f"{self.status_extra}{note}"
+            f"{self.status_extra}{f' · E0: {zero}' if zero else ''}{note}"
         )
 
     def detail_lines(self) -> list[str]:
@@ -1273,8 +1410,13 @@ class DomainWorker:
     def ignores_episode_zero(self, slug: str, season: int | str) -> bool:
         """True when this family's scraper has episode 0 of this season on its ignore list."""
         if self._ignored_seasons is None:
-            self._ignored_seasons = load_ignored_seasons(self.family)
+            self._ignored_seasons = load_ignore_list(self.family).seasons
         return (slug_key(slug), str(season)) in self._ignored_seasons
+
+    def _episode_zero_watched(self, doc) -> bool | None:
+        """Whether the page's episode 0 shows as watched; None when it has none."""
+        rows = [row for row in self._episode_rows(doc) if self._episode_number(row) == 0]
+        return all(self._row_is_watched(row) for row in rows) if rows else None
 
     def _count_episodes(self, doc, skip_episode_zero: bool = False) -> tuple[int, int]:
         """Return (watched_count, total_count) for a season page.
@@ -1457,22 +1599,11 @@ class DomainWorker:
             logger.exception("Could not load season %s of %s: %s", season, slug, exc)
             return SeasonOutcome(season=season, ok=False, note=f"load failed: {exc}")
 
-        skip_zero = self.ignores_episode_zero(slug, season)
-        before, total = self._count_episodes(soup, skip_zero)
-        outcome.total = total
-        outcome.watched_before = before
-        outcome.watched_after = before
+        listed = self.ignores_episode_zero(slug, season)
+        before, total = self._count_episodes(soup, listed)
+        ep0 = self._episode_zero_watched(soup)
 
-        if total == 0 and skip_zero and self._count_episodes(soup)[1]:
-            # Nothing here but the ignored placeholder: no mark would change
-            # anything, and spending one of s.to's rationed POSTs on it every
-            # run is how it used to fail.
-            outcome.note = "only episode 0, which is ignored"
-            outcome.placeholder_only = True
-            logger.info("Skipping %s season %s: its only episode is the ignored episode 0", slug, season)
-            return outcome
-
-        if total == 0:
+        if total == 0 and ep0 is None:
             # No episode rows parsed means we cannot mark or verify anything.
             # Reporting success here would be a silent lie.
             outcome.ok = False
@@ -1480,10 +1611,18 @@ class DomainWorker:
             logger.error("No episode rows found on %s — cannot mark or verify", season_url)
             return outcome
 
+        outcome.total = total
+        outcome.watched_before = outcome.watched_after = before
+        outcome.listed = listed
+        outcome.ep0_before = outcome.ep0_after = ep0
+
         target = total if action == ACTION_WATCHED else 0
-        if before == target:
+        if not outcome.needs_mark(action):
             logger.info("Skipping mark for %s season %s (already %s)", slug, season, action)
         else:
+            # A listed episode 0 is marked like the rest even though it does
+            # not count: that is the only way to see whether it still refuses
+            # to stick, or has started to and no longer belongs on the list.
             try:
                 try:
                     await self._issue_mark(soup, season_url, slug, season, action)
@@ -1509,7 +1648,9 @@ class DomainWorker:
             outcome.note = f"unverified: {exc}"
             logger.error("Could not verify season %s of %s: %s", season, slug, exc)
             return outcome
-        after, after_total = self._count_episodes(after_doc, skip_zero)
+        after, after_total = self._count_episodes(after_doc, listed)
+        outcome.ep0_after = self._episode_zero_watched(after_doc)
+        self._log_episode_zero(slug, season, outcome, action)
 
         if after_total and after_total != total:
             logger.warning(
@@ -1549,6 +1690,13 @@ class DomainWorker:
                 )
         return outcome
 
+    @staticmethod
+    def _log_episode_zero(slug: str, season: int | str, outcome: SeasonOutcome, action: str) -> None:
+        note = outcome.episode_zero(action)
+        if note is not None:
+            level = logging.WARNING if note.attention else logging.INFO
+            logger.log(level, "Episode 0 of %s season %s: %s", slug, season, note.text)
+
     def _only_episode_zero_unwatched(self, doc) -> bool:
         unwatched = [self._episode_number(row) for row in self._episode_rows(doc) if not self._row_is_watched(row)]
         return bool(unwatched) and all(number == 0 for number in unwatched)
@@ -1574,10 +1722,12 @@ class DomainWorker:
 
         for season in seasons:
             season_soup = await self._get_soup(self.season_url(slug, season))
-            skip_zero = self.ignores_episode_zero(slug, season)
-            before, total = self._count_episodes(season_soup, skip_zero)
-            outcome = SeasonOutcome(season=season, total=total, watched_before=before, watched_after=before)
-            outcome.placeholder_only = total == 0 and skip_zero and self._count_episodes(season_soup)[1] > 0
+            listed = self.ignores_episode_zero(slug, season)
+            before, total = self._count_episodes(season_soup, listed)
+            ep0 = self._episode_zero_watched(season_soup)
+            outcome = SeasonOutcome(
+                season=season, total=total, watched_before=before, listed=listed, ep0_before=ep0, ep0_after=ep0
+            )
             # watched_after holds the *planned* state so the preview can render
             # "12/24 → 24/24"; the marking pass overwrites it with reality.
             outcome.watched_after = outcome.target(action)
@@ -1639,6 +1789,7 @@ class RunReport:
     failed: int = 0
     failed_urls: list[str] = field(default_factory=list)
     rejected: list[dict] = field(default_factory=list)
+    ignore_lists: list[IgnoreList] = field(default_factory=list)
 
 
 async def process_batch(
@@ -2182,16 +2333,34 @@ def _print_run_summary(report: RunReport, results: list[SeriesResult]) -> None:
         rows = [[r.host, r.title or r.slug, r.line()] for r in results]
         _print_table(["Host", "Series", "Result"], rows, [col, col, col])
 
+    zero = [(r, s, n) for r in results for s, n in r.episode_zero_notes()]
+    if zero:
+        # The table cell cuts these short; this is where they are read in full.
+        print("\n  " + term.step("EPISODE 0"))
+        for r, s, n in zero:
+            print(f"    {'⚠' if n.attention else '▶'} {r.host}  {r.title or r.slug}  S{s.season}: {n.text}")
+            if n.kind == "unlisted":
+                path = IGNORED_SEASONS_FILES.get(r.family) or "the scraper's .ignored_seasons.json"
+                print(f'        if it is a placeholder, add {{"slug": "{r.slug}", "season": "{s.season}"}} to {path}')
+            elif n.kind in ("sticks", "stale"):
+                print(f"        if so, remove it from {IGNORED_SEASONS_FILES.get(r.family)}")
+        print()
+
     metrics = [
         ("Series processed", str(report.total_urls)),
         ("Successful", str(report.successful)),
         ("Failed", str(report.failed)),
         ("Episodes watched", f"{sum(r.watched_episodes for r in results)}/{sum(r.total_episodes for r in results)}"),
     ]
+    if zero:
+        to_check = sum(1 for _r, _s, n in zero if n.attention)
+        metrics.append(("Episode 0", f"{len(zero) - to_check} known placeholder(s), {to_check} to check"))
     if report.rejected:
         metrics.append(("Unsupported lines", str(len(report.rejected))))
     if report.failed:
         metrics.append(("Failed list", FAILED_URLS_FILE))
+    # Repeated from the top of the run, which a long batch scrolls away.
+    metrics += [("Ignore list", f"⚠ {il.family}: {il.problem}") for il in report.ignore_lists if il.warning]
 
     label_w = max(len(m[0]) for m in metrics)
     for label, value in metrics:
@@ -2273,7 +2442,11 @@ async def _preview(
 
                 needs_sub = action == ACTION_WATCHED and worker.needs_subscribe and result.subscribed is False
                 needs_episodes = any(s.watched_before != s.target(action) for s in result.seasons)
+                # A listed episode 0 alone is reason enough to mark: it does
+                # not count, but it is still checked and reported every run.
+                needs_mark = any(s.needs_mark(action) for s in result.seasons)
                 unreadable = any(s.total == 0 and not s.placeholder_only for s in result.seasons)
+                zero_lines = [f"        {line}" for line in result.episode_zero_lines(planned=True)]
 
                 sub_badge = " ⚡" if needs_sub else ""
                 counter = f"{result.watched_before}/{result.total_episodes}"
@@ -2289,10 +2462,11 @@ async def _preview(
                 # silent while it is read.
                 print(f"    [{scanned:>{width}}/{total}] {host}  {result.title or result.slug}")
 
-                if needs_episodes or needs_sub or unreadable:
+                if needs_mark or needs_sub or unreadable:
                     todo.append((result, plan))
                     block = [headline]
                     block += [f"        {line}" for line in result.detail_lines()]
+                    block += zero_lines
                     if unreadable:
                         block.append("        ⚠ some seasons list no episodes — will be reported as failed")
                     todo_lines.extend(block)
@@ -2300,7 +2474,10 @@ async def _preview(
                     done.append(result)
                     # Nothing is changing here, so the per-season breakdown
                     # would be noise; the counter already says it is complete.
+                    # Episode 0 findings are not noise: a stale entry or a
+                    # listed placeholder that now sticks is only seen here.
                     done_lines.append(headline)
+                    done_lines.extend(zero_lines)
 
     if done_lines:
         _print_section("ALREADY AT TARGET", len(done))
@@ -2330,6 +2507,7 @@ async def run_action(action: str, grouped: dict[str, list[str]], rejected: list[
         return
 
     print_batch_summary(grouped, action=action)
+    ignore_lists = _print_ignore_lists(grouped)
     print("\n  → preview before marking:")
     print(f"  action: {action}")
     print()
@@ -2344,6 +2522,7 @@ async def run_action(action: str, grouped: dict[str, list[str]], rejected: list[
             report.successful = len(done)
             report.failed_urls = [r.url for r in broken]
             report.rejected = rejected
+            report.ignore_lists = ignore_lists
             _persist_failed_urls(report, {r.url for r in results}, action)
             _print_run_summary(report, results)
         else:
@@ -2351,6 +2530,9 @@ async def run_action(action: str, grouped: dict[str, list[str]], rejected: list[
         return
 
     print(f"\n  → {len(done)} already at target state, {len(todo)} series to change.")
+    for il in ignore_lists:
+        if il.warning:
+            print(f"  ⚠ {il.family} ignore list: {il.problem}")
     if not ask_yes_no("\n  proceed with marking?", default=False):
         print("  marking cancelled.")
         return
@@ -2364,7 +2546,26 @@ async def run_action(action: str, grouped: dict[str, list[str]], rejected: list[
     # and re-verified a second time.
     report, results = await process_batch(action, plans_by_host, done + broken)
     report.rejected = rejected
+    report.ignore_lists = ignore_lists
     _print_run_summary(report, results)
+
+
+def _print_ignore_lists(grouped: dict[str, list[str]]) -> list[IgnoreList]:
+    """Show which episode 0 ignore list each family in this batch runs with.
+
+    Printed every run, not only when something is wrong: which file was read
+    and how many seasons it holds is what tells a known placeholder from a
+    list that quietly stopped being found.
+    """
+    families = sorted({SUPPORTED_DOMAINS[host] for host in grouped if host in SUPPORTED_DOMAINS})
+    ignore_lists = [load_ignore_list(family) for family in families]
+    if ignore_lists:
+        print("\n  episode 0 ignore lists (read from the scrapers):")
+    for il in ignore_lists:
+        print(f"    {il.status_line()}")
+        if il.warning:
+            logger.warning("Episode 0 ignore list for %s: %s", il.family, il.problem)
+    return ignore_lists
 
 
 def _urls_by_family(grouped: dict[str, list[str]]) -> dict[str, set[str]]:

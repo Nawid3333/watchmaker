@@ -8,11 +8,13 @@ episode counting, and the post-mark verification.
 """
 
 import asyncio
+import io
 import json
 import os
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -587,12 +589,21 @@ class TestEpisodeZero(unittest.IsolatedAsyncioTestCase):
         w = DomainWorker("serienstream.to")
         self.assertEqual(w._count_episodes(soup(episodes(3, 1)), skip_episode_zero=True), (1, 3))
 
-    async def test_a_season_holding_only_the_ignored_placeholder_is_left_alone(self):
-        w = self.worker([numbered((0, False))], ignored={("marry-my-husband", "0")})
+    async def test_a_season_holding_only_the_ignored_placeholder_is_still_marked_and_checked(self):
+        w = self.worker([numbered((0, False)), numbered((0, False))], ignored={("marry-my-husband", "0")})
         outcome = await w.mark_season("marry-my-husband", 0, ACTION_WATCHED)
         self.assertTrue(outcome.ok)
         self.assertTrue(outcome.placeholder_only)
-        self.assertEqual(w.marks, [])
+        self.assertEqual(w.marks, [("marry-my-husband", 0, ACTION_WATCHED)])
+        self.assertEqual(outcome.episode_zero(ACTION_WATCHED).kind, "placeholder")
+        self.assertFalse(outcome.episode_zero(ACTION_WATCHED).attention)
+
+    async def test_a_listed_episode_zero_is_marked_even_when_every_counted_episode_is_done(self):
+        w = self.worker([numbered((0, False), (1, True)), numbered((0, False), (1, True))], ignored={("x", "1")})
+        outcome = await w.mark_season("x", 1, ACTION_WATCHED)
+        self.assertTrue(outcome.ok)
+        self.assertEqual(w.marks, [("x", 1, ACTION_WATCHED)])
+        self.assertIn("known placeholder", outcome.episode_zero(ACTION_WATCHED).text)
 
     async def test_an_ignored_placeholder_does_not_fail_verification(self):
         w = self.worker(
@@ -602,6 +613,33 @@ class TestEpisodeZero(unittest.IsolatedAsyncioTestCase):
         outcome = await w.mark_season("x", 1, ACTION_WATCHED)
         self.assertTrue(outcome.ok)
         self.assertEqual((outcome.watched_after, outcome.total), (1, 1))
+
+    async def test_a_listed_episode_zero_that_now_sticks_is_flagged(self):
+        w = self.worker([numbered((0, False), (1, False)), numbered((0, True), (1, True))], ignored={("x", "1")})
+        outcome = await w.mark_season("x", 1, ACTION_WATCHED)
+        self.assertTrue(outcome.ok)
+        note = outcome.episode_zero(ACTION_WATCHED)
+        self.assertEqual(note.kind, "sticks")
+        self.assertTrue(note.attention)
+
+    async def test_a_listed_season_without_an_episode_zero_is_flagged_as_stale(self):
+        w = self.worker([numbered((1, False)), numbered((1, True))], ignored={("x", "1")})
+        outcome = await w.mark_season("x", 1, ACTION_WATCHED)
+        self.assertTrue(outcome.ok)
+        self.assertEqual(outcome.episode_zero(ACTION_WATCHED).kind, "stale")
+
+    async def test_a_listed_season_with_no_rows_is_still_a_failure(self):
+        w = self.worker(["<html></html>"], ignored={("x", "1")})
+        outcome = await w.mark_season("x", 1, ACTION_WATCHED)
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.note, "no episodes found")
+        self.assertIsNone(outcome.episode_zero(ACTION_WATCHED), "an unread page is not a stale entry")
+
+    async def test_unwatching_leaves_a_listed_placeholder_unreported(self):
+        w = self.worker([numbered((0, False), (1, True)), numbered((0, False), (1, False))], ignored={("x", "1")})
+        outcome = await w.mark_season("x", 1, ACTION_UNWATCHED)
+        self.assertTrue(outcome.ok)
+        self.assertIsNone(outcome.episode_zero(ACTION_UNWATCHED))
 
     async def test_the_ignore_list_is_per_season(self):
         w = self.worker([numbered((0, False), (1, False)), numbered((0, False), (1, True))], ignored={("x", "2")})
@@ -613,30 +651,161 @@ class TestEpisodeZero(unittest.IsolatedAsyncioTestCase):
         outcome = await w.mark_season("x", 1, ACTION_WATCHED)
         self.assertFalse(outcome.ok)
         self.assertIn("episode 0 will not stay watched", outcome.note)
+        note = outcome.episode_zero(ACTION_WATCHED)
+        self.assertEqual(note.kind, "unlisted")
+        self.assertTrue(note.attention)
+
+    async def test_an_unlisted_episode_zero_that_sticks_says_nothing(self):
+        w = self.worker([numbered((0, False), (1, False)), numbered((0, True), (1, True))])
+        outcome = await w.mark_season("x", 1, ACTION_WATCHED)
+        self.assertTrue(outcome.ok)
+        self.assertIsNone(outcome.episode_zero(ACTION_WATCHED))
 
 
-class TestLoadIgnoredSeasons(unittest.TestCase):
+class TestEpisodeZeroInTheCli(unittest.TestCase):
+    """Every episode 0 the run met is shown, not only logged."""
+
+    @staticmethod
+    def _result(*seasons, action=ACTION_WATCHED):
+        return SeriesResult("serienstream.to", "sto", "u", "x", action=action, title="X", seasons=list(seasons))
+
+    def test_a_listed_placeholder_alone_is_reason_to_mark(self):
+        season = SeasonOutcome(season=1, total=1, watched_before=1, listed=True, ep0_before=False)
+        self.assertTrue(season.needs_mark(ACTION_WATCHED))
+
+    def test_the_preview_says_what_will_happen_to_episode_zero(self):
+        r = self._result(
+            SeasonOutcome(season=1, total=1, watched_before=1, listed=True, ep0_before=False),
+            SeasonOutcome(season=2, total=2, watched_before=1, ep0_before=False),
+        )
+        lines = r.episode_zero_lines(planned=True)
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[0].startswith("▶S1 E0:"))
+        self.assertIn("marked anyway and checked", lines[0])
+        self.assertIn("not on the ignore list", lines[1])
+
+    def test_the_result_line_carries_a_short_tag(self):
+        r = self._result(
+            SeasonOutcome(
+                season=0, total=0, watched_before=0, watched_after=0, listed=True, ep0_before=False, ep0_after=False
+            )
+        )
+        self.assertTrue(r.line().startswith("✓"))
+        self.assertIn(" · E0: S0 placeholder", r.line())
+
+    def _summary(self, results, ignore_lists=()):
+        report = main.RunReport(total_urls=len(results), successful=len(results))
+        report.ignore_lists = list(ignore_lists)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            main._print_run_summary(report, results)
+        return out.getvalue()
+
+    def test_the_run_summary_lists_every_finding_in_full(self):
+        listed = SeasonOutcome(
+            season=1, total=1, watched_before=1, watched_after=1, listed=True, ep0_before=False, ep0_after=False
+        )
+        unlisted = SeasonOutcome(
+            season=2, total=2, watched_before=1, watched_after=1, ep0_before=False, ep0_after=False
+        )
+        text = self._summary([self._result(listed, unlisted)])
+        self.assertIn("EPISODE 0", text)
+        self.assertIn("S1: episode 0 did not stay watched — a known placeholder", text)
+        self.assertIn('add {"slug": "x", "season": "2"}', text)
+        self.assertIn("1 known placeholder(s), 1 to check", text)
+
+    def test_an_ignore_list_problem_is_repeated_in_the_summary(self):
+        missing = main.IgnoreList("sto", "p", problem="not found: p — no episode 0 is ignored", warning=True)
+        expected = main.IgnoreList("bs", "q", problem="none — its scraper keeps no ignore list")
+        text = self._summary([self._result()], [missing, expected])
+        self.assertIn("sto: not found: p", text)
+        self.assertNotIn("bs:", text)
+
+    def test_an_unread_listed_season_is_not_called_stale(self):
+        """A page with no episode rows at all is a failed read, reported as
+        one. The preview also called its ignore-list entry stale, which could
+        get a correct entry removed."""
+        season = SeasonOutcome(season=1, total=0, watched_before=0, listed=True, ep0_before=None)
+        self.assertIsNone(season.episode_zero(ACTION_WATCHED, planned=True))
+        self.assertEqual(self._result(season).episode_zero_lines(planned=True), [])
+
+    def test_the_summary_says_which_entries_to_remove(self):
+        sticks = SeasonOutcome(
+            season=1, total=1, watched_before=0, watched_after=1, listed=True, ep0_before=False, ep0_after=True
+        )
+        stale = SeasonOutcome(season=2, total=3, watched_before=0, watched_after=3, listed=True)
+        with mock.patch.object(main, "IGNORED_SEASONS_FILES", {"sto": "ignored.json"}):
+            text = self._summary([self._result(sticks, stale)])
+        self.assertIn("S1: episode 0 is watched although the ignore list names it a placeholder", text)
+        self.assertIn("S2: on the ignore list, but this season has no episode 0", text)
+        self.assertEqual(text.count("if so, remove it from ignored.json"), 2)
+        self.assertIn("0 known placeholder(s), 2 to check", text)
+
+
+class TestLoadIgnoreList(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
         self.path = os.path.join(self.dir.name, ".ignored_seasons.json")
-        patcher = mock.patch.dict(main.IGNORED_SEASONS_FILES, {"sto": self.path})
+        # Replaced, not patched in place: main and config share one dict, and
+        # under plain unittest (no conftest copy) patching it would change the
+        # config paths the last test below checks.
+        patcher = mock.patch.object(main, "IGNORED_SEASONS_FILES", {"sto": self.path, "bs": self.path})
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def test_entries_are_read_with_slugs_folded_like_the_scraper_folds_them(self):
-        entries = [{"slug": "Marry%20My-Husband", "season": "0"}, {"slug": "x", "season": 3}, {"season": "1"}]
-        Path(self.path).write_text(json.dumps(entries), encoding="utf-8")
-        self.assertEqual(main.load_ignored_seasons("sto"), {("marry my-husband", "0"), ("x", "3")})
+    def write(self, text):
+        Path(self.path).write_text(text, encoding="utf-8")
 
-    def test_a_missing_or_broken_file_ignores_nothing(self):
-        self.assertEqual(main.load_ignored_seasons("sto"), frozenset())
-        Path(self.path).write_text("{not json", encoding="utf-8")
-        self.assertEqual(main.load_ignored_seasons("sto"), frozenset())
+    def test_entries_are_read_with_slugs_folded_like_the_scraper_folds_them(self):
+        self.write(json.dumps([{"slug": "Marry%20My-Husband", "season": "0"}, {"slug": "x", "season": 3}]))
+        il = main.load_ignore_list("sto")
+        self.assertEqual(il.seasons, {("marry my-husband", "0"), ("x", "3")})
+        self.assertEqual(il.problem, "")
+        self.assertTrue(il.status_line().startswith("✓ sto"))
+        self.assertIn("2 season(s)", il.status_line())
+
+    def test_entries_without_a_slug_are_counted_not_dropped_silently(self):
+        self.write(json.dumps([{"slug": "x", "season": "1"}, {"season": "1"}]))
+        il = main.load_ignore_list("sto")
+        self.assertEqual(il.seasons, {("x", "1")})
+        self.assertTrue(il.warning)
+        self.assertIn("1 entr(y/ies) without a slug skipped", il.problem)
+
+    def test_a_missing_file_ignores_nothing_and_says_so(self):
+        il = main.load_ignore_list("sto")
+        self.assertEqual(il.seasons, frozenset())
+        self.assertTrue(il.warning)
+        self.assertIn("not found", il.problem)
+        self.assertTrue(il.status_line().startswith("⚠ sto"))
+
+    def test_a_broken_file_ignores_nothing_and_says_so(self):
+        self.write("{not json")
+        il = main.load_ignore_list("sto")
+        self.assertEqual(il.seasons, frozenset())
+        self.assertTrue(il.warning)
+        self.assertIn("could not read", il.problem)
+
+    def test_a_file_that_is_not_a_list_ignores_nothing_and_says_so(self):
+        self.write('{"slug": "x"}')
+        il = main.load_ignore_list("sto")
+        self.assertEqual(il.seasons, frozenset())
+        self.assertIn("not a JSON list", il.problem)
+
+    def test_bs_keeps_no_list_so_its_absence_is_only_noted(self):
+        il = main.load_ignore_list("bs")
+        self.assertFalse(il.warning)
+        self.assertIn("keeps no ignore list", il.problem)
+
+    def test_a_bs_file_that_does_exist_is_still_read(self):
+        self.write(json.dumps([{"slug": "x", "season": "1"}]))
+        self.assertEqual(main.load_ignore_list("bs").seasons, {("x", "1")})
 
     def test_a_family_without_a_scraper_ignores_nothing(self):
-        with mock.patch.dict(main.IGNORED_SEASONS_FILES, {"bs": None}):
-            self.assertEqual(main.load_ignored_seasons("bs"), frozenset())
+        with mock.patch.dict(main.IGNORED_SEASONS_FILES, {"bs": None, "sto": None}):
+            self.assertEqual(main.load_ignore_list("bs").seasons, frozenset())
+            self.assertFalse(main.load_ignore_list("bs").warning)
+            self.assertTrue(main.load_ignore_list("sto").warning)
 
     def test_the_file_sits_in_the_scraper_data_folder_next_to_its_url_list(self):
         import config
@@ -645,6 +814,25 @@ class TestLoadIgnoredSeasons(unittest.TestCase):
             export = config.SERIES_URLS_EXPORTS[family]
             if export:
                 self.assertEqual(path, os.path.join(os.path.dirname(export), "data", ".ignored_seasons.json"))
+
+    def test_every_family_said_to_keep_a_list_is_a_real_family(self):
+        """A misspelt family here would quietly turn its missing list from a
+        warning into a note."""
+        import config
+
+        self.assertLessEqual(config.IGNORE_LIST_FAMILIES, set(config.SUPPORTED_DOMAINS.values()))
+        self.assertLessEqual(config.IGNORE_LIST_FAMILIES, set(config.IGNORED_SEASONS_FILES))
+
+    def test_every_family_in_the_batch_is_shown_before_the_preview(self):
+        grouped = {"serienstream.to": ["u1"], "burningseries.ac": ["u2"]}
+        out = io.StringIO()
+        with redirect_stdout(out):
+            lists = main._print_ignore_lists(grouped)
+        self.assertEqual([il.family for il in lists], ["bs", "sto"])
+        text = out.getvalue()
+        self.assertIn("episode 0 ignore lists", text)
+        self.assertIn("⚠ sto", text)
+        self.assertIn("· bs", text)
 
 
 class TestSeasonUrls(unittest.TestCase):
@@ -1175,6 +1363,39 @@ class TestPreviewAcrossHosts(HostFlowCase):
 
         self.assertEqual(len(ScriptedWorker.made), 2)
         self.assertTrue(all(w.closed for w in ScriptedWorker.made))
+
+
+class TestPreviewStillTriesEpisodeZero(HostFlowCase):
+    """A listed episode 0 is tried on every run, even for a series whose
+    counted episodes are all done: a placeholder that starts to stick is a
+    change on the site worth hearing about, and one that does not is still
+    reported, so it is always known which series carry one."""
+
+    GROUPED = {"serienstream.to": ["https://serienstream.to/serie/one"]}
+
+    async def _preview_with(self, season):
+        def result(worker, url, action, slug):
+            return SeriesResult(worker.host, worker.family, url, slug, action=action, seasons=[season], title=slug)
+
+        with mock.patch.object(ScriptedWorker, "_result", result), redirect_stdout(io.StringIO()) as out:
+            todo, done, broken = await main._preview(ACTION_WATCHED, dict(self.GROUPED))
+        return todo, done, out.getvalue()
+
+    async def test_a_series_at_target_with_a_listed_episode_zero_is_still_marked(self):
+        season = SeasonOutcome(
+            season=1, total=5, watched_before=5, watched_after=5, listed=True, ep0_before=False, ep0_after=False
+        )
+        todo, done, out = await self._preview_with(season)
+        self.assertEqual((len(todo), len(done)), (1, 0), "it has to go to the marking pass")
+        self.assertIn("E0: episode 0 is not watched — a known placeholder (ignore list); marked anyway", out)
+
+    async def test_a_listed_episode_zero_that_already_stays_watched_is_flagged(self):
+        season = SeasonOutcome(
+            season=1, total=5, watched_before=5, watched_after=5, listed=True, ep0_before=True, ep0_after=True
+        )
+        todo, done, out = await self._preview_with(season)
+        self.assertEqual((len(todo), len(done)), (0, 1), "nothing left to mark")
+        self.assertIn("the entry may no longer be needed", out)
 
 
 class TestProcessBatchAcrossHosts(HostFlowCase):
