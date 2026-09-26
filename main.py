@@ -86,6 +86,9 @@ _BASE_BACKOFF = 1.0
 _MAX_BACKOFF = 30.0
 _RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
 _OK_POST_STATUS = frozenset({200, 201, 204, 301, 302})
+# Whole login attempts, each from a freshly fetched login page (and so a fresh
+# CSRF token). Only an error is retried; a clean refusal is final.
+_LOGIN_ATTEMPTS = 3
 
 # s.to accepts 30 POSTs per account per 60 s -- season marks and subscribes
 # together -- then answers 429, with no Retry-After, to every POST until the
@@ -1041,12 +1044,34 @@ class DomainWorker:
         if not any(self.creds.values()):
             logger.error("No credentials for family %r", self.family)
             return False
+        for attempt in range(1, _LOGIN_ATTEMPTS + 1):
+            try:
+                # A clean answer, including wrong credentials, is final:
+                # sending the same password again would not change it.
+                self.logged_in = await self._login_form()
+                return self.logged_in
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Login attempt %d/%d for %s failed: %s", attempt, _LOGIN_ATTEMPTS, self.host, exc)
+            # 2026-09-26: s.to answered the login POST with 500, the retry of
+            # that same POST got 419 (CSRF token expired), and a whole run was
+            # lost. A login can land on the server and still answer with an
+            # error -- the session has then moved on to a new token -- so look
+            # before trying again, and try again from a fresh login page.
+            if await self._session_is_logged_in():
+                logger.info("Login for %s went through despite the error", self.host)
+                self.logged_in = True
+                return True
+            if attempt < _LOGIN_ATTEMPTS:
+                await asyncio.sleep(_BASE_BACKOFF * 2**attempt)
+        logger.error("Login failed for %s after %d attempts", self.host, _LOGIN_ATTEMPTS)
+        return False
+
+    async def _session_is_logged_in(self) -> bool:
         try:
-            self.logged_in = await self._login_form()
+            return self._is_logged_in(await self._get_soup(self.base))
         except Exception as exc:  # noqa: BLE001
-            logger.exception("Login failed for %s: %s", self.host, exc)
+            logger.warning("Session check failed for %s: %s", self.host, exc)
             return False
-        return self.logged_in
 
     async def _login_form(self) -> bool:
         base = self.base
@@ -1113,11 +1138,8 @@ class DomainWorker:
         controls. Returning False means the session is fine and the control is
         genuinely absent, so the caller should not retry.
         """
-        try:
-            if self._is_logged_in(await self._get_soup(self.base)):
-                return False
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Session check failed for %s: %s", self.host, exc)
+        if await self._session_is_logged_in():
+            return False
 
         logger.warning("Session for %s looks expired — re-authenticating", self.host)
         self.logged_in = False

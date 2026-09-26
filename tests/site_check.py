@@ -350,6 +350,9 @@ def main_cli(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Check the three live sites for changes that would break watchmaker.")
     ap.add_argument("--report", help="also write the markdown report to this file")
     args = ap.parse_args(argv)
+    # The report is full of ✅/❌; a Windows console or pipe on cp1252 crashed
+    # on printing it after every check had already run.
+    main._configure_console()
     try:
         results = asyncio.run(run_checks())
         report, code = render(results, date.today()), exit_code(results)

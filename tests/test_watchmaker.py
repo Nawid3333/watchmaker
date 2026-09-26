@@ -936,6 +936,64 @@ class LoginRecordingWorker(DomainWorker):
         return _FakeResponse(200, "")
 
 
+class FlakyLoginWorker(LoginRecordingWorker):
+    """Each login POST takes the next scripted outcome: an exception (the
+    site erroring), True (credentials accepted) or False (refused)."""
+
+    def __init__(self, outcomes, *, logged_in_after_error=False):
+        super().__init__("burningseries.ac", BS_LOGGED_OUT_HOME)
+        self.outcomes = list(outcomes)
+        self.logged_in_after_error = logged_in_after_error
+        self.session = False
+        self.posts = 0
+
+    async def _get_soup(self, url):
+        self.fetched.append(url)
+        if url.endswith("/login"):
+            return soup(self.login_page)
+        return soup(BS_LOGGED_IN_HOME if self.session else BS_LOGGED_OUT_HOME)
+
+    async def _post(self, url, data=None, *, json=None, headers=None):
+        self.posts += 1
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            self.session = self.logged_in_after_error
+            raise outcome
+        self.session = outcome
+        return _FakeResponse(200, "")
+
+
+class TestLoginRecovery(unittest.IsolatedAsyncioTestCase):
+    """2026-09-26: s.to answered a login POST with 500, the blind resend of
+    the same form got 419 (expired CSRF token), and the whole run failed."""
+
+    def setUp(self):
+        patcher = mock.patch.object(main.asyncio, "sleep", new=mock.AsyncMock())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def test_a_login_that_errored_but_went_through_is_kept(self):
+        w = FlakyLoginWorker([RuntimeError("500")], logged_in_after_error=True)
+        self.assertTrue(await w.login())
+        self.assertEqual(w.posts, 1)
+
+    async def test_an_error_is_retried_from_a_fresh_login_page(self):
+        w = FlakyLoginWorker([RuntimeError("500"), True])
+        self.assertTrue(await w.login())
+        self.assertEqual(w.posts, 2)
+        self.assertEqual(w.fetched.count("https://burningseries.ac/login"), 2)
+
+    async def test_wrong_credentials_are_not_sent_again(self):
+        w = FlakyLoginWorker([False])
+        self.assertFalse(await w.login())
+        self.assertEqual(w.posts, 1)
+
+    async def test_it_gives_up_after_the_last_attempt(self):
+        w = FlakyLoginWorker([RuntimeError("500")] * main._LOGIN_ATTEMPTS)
+        self.assertFalse(await w.login())
+        self.assertEqual(w.posts, main._LOGIN_ATTEMPTS)
+
+
 class TestLoginStateDetection(unittest.TestCase):
     def test_the_bs_homepage_navigation_shows_a_logged_in_session(self):
         worker = LoginRecordingWorker("burningseries.ac", BS_LOGGED_IN_HOME)
