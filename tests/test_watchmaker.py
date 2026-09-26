@@ -439,7 +439,13 @@ class FakeWorker(DomainWorker):
         self.logged_in = True
 
     async def _get_soup(self, url):
-        return soup(self.pages.pop(0))
+        # Strict on purpose: a read the script did not plan for is an
+        # IndexError, so an extra request cannot slip in unnoticed. An
+        # exception in the script is raised at that read.
+        page = self.pages.pop(0)
+        if isinstance(page, Exception):
+            raise page
+        return soup(page)
 
     async def _issue_mark(self, doc, season_url, slug, season, action):
         self.marks.append((slug, season, action))
@@ -463,15 +469,16 @@ class TestMarkSeason(unittest.IsolatedAsyncioTestCase):
     async def test_mark_that_silently_did_nothing_is_a_failure(self):
         # The sites answer 200 even when nothing changed; only re-reading the
         # page proves the mark landed.
-        w = FakeWorker("serienstream.to", [episodes(5, 0), episodes(5, 0)])
+        w = FakeWorker("serienstream.to", [episodes(5, 0), episodes(5, 0), episodes(5, 0)])
         outcome = await w.mark_season("x", 1, ACTION_WATCHED)
         self.assertFalse(outcome.ok)
-        self.assertIn("expected 5/5", outcome.note)
+        self.assertEqual(outcome.note, "expected 5/5 after watched, got 0 (marked twice)")
 
     async def test_partial_mark_is_a_failure(self):
-        w = FakeWorker("serienstream.to", [episodes(5, 0), episodes(5, 3)])
+        w = FakeWorker("serienstream.to", [episodes(5, 0), episodes(5, 3), episodes(5, 3)])
         outcome = await w.mark_season("x", 1, ACTION_WATCHED)
         self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.note, "expected 5/5 after watched, got 3 (marked twice)")
 
     async def test_unwatch_is_verified_against_zero(self):
         w = FakeWorker("serienstream.to", [episodes(5, 5), episodes(5, 0)])
@@ -549,6 +556,77 @@ class TestMarkSeason(unittest.IsolatedAsyncioTestCase):
         outcome = await w.mark_season("x", 1, ACTION_WATCHED)
         self.assertFalse(outcome.ok)
         self.assertIn("season-mark", outcome.note)
+
+
+class TestSecondMark(unittest.IsolatedAsyncioTestCase):
+    """A mark the site answers with 200 does not always land. A season a mark
+    left off target is marked once more and read back again before it counts
+    as failed -- once, never a third time, and never for a season that needed
+    no mark to begin with."""
+
+    async def test_a_mark_that_did_not_stick_is_sent_once_more_and_can_succeed(self):
+        w = FakeWorker("serienstream.to", [episodes(5, 0), episodes(5, 0), episodes(5, 5)])
+        outcome = await w.mark_season("x", 1, ACTION_WATCHED)
+        self.assertTrue(outcome.ok)
+        self.assertEqual(w.marks, [("x", 1, ACTION_WATCHED)] * 2)
+        self.assertEqual((outcome.marks, outcome.watched_after), (2, 5))
+        self.assertEqual(outcome.note, "stuck on the second mark")
+
+    async def test_a_mark_that_fails_twice_is_a_failure_after_exactly_two_marks(self):
+        w = FakeWorker("serienstream.to", [episodes(5, 0), episodes(5, 2), episodes(5, 4)])
+        outcome = await w.mark_season("x", 1, ACTION_WATCHED)
+        self.assertFalse(outcome.ok)
+        self.assertEqual(len(w.marks), 2, "never a third mark")
+        self.assertEqual(outcome.note, "expected 5/5 after watched, got 4 (marked twice)")
+        self.assertEqual(outcome.watched_after, 4, "the last read-back is what is reported")
+
+    async def test_unwatching_gets_the_second_mark_too(self):
+        w = FakeWorker("serienstream.to", [episodes(5, 5), episodes(5, 5), episodes(5, 0)])
+        outcome = await w.mark_season("x", 1, ACTION_UNWATCHED)
+        self.assertTrue(outcome.ok)
+        self.assertEqual(len(w.marks), 2)
+
+    async def test_a_mark_that_stuck_the_first_time_is_sent_once(self):
+        w = FakeWorker("serienstream.to", [episodes(5, 0), episodes(5, 5)])  # a third read would raise
+        outcome = await w.mark_season("x", 1, ACTION_WATCHED)
+        self.assertTrue(outcome.ok)
+        self.assertEqual((len(w.marks), outcome.marks, outcome.note), (1, 1, ""))
+
+    async def test_a_season_that_needed_no_mark_is_not_marked_on_a_bad_read_back(self):
+        w = FakeWorker("serienstream.to", [episodes(5, 5), episodes(5, 2)])
+        outcome = await w.mark_season("x", 1, ACTION_WATCHED)
+        self.assertFalse(outcome.ok)
+        self.assertEqual(w.marks, [], "a changed page is reported, not answered with a mark")
+
+    async def test_a_known_placeholder_does_not_trigger_the_second_mark(self):
+        # Episode 0 is listed, so it is not counted: its refusal to stick
+        # leaves the season on target, and costs no second POST.
+        w = FakeWorker("serienstream.to", [numbered((0, False), (1, False)), numbered((0, False), (1, True))])
+        w._ignored_seasons = frozenset({("x", "1")})
+        outcome = await w.mark_season("x", 1, ACTION_WATCHED)
+        self.assertTrue(outcome.ok)
+        self.assertEqual(len(w.marks), 1)
+
+    async def test_a_refused_second_mark_is_reported_as_such(self):
+        calls = []
+
+        def refuse_second():
+            calls.append(1)
+            if len(calls) == 2:
+                raise RuntimeError("POST refused")
+
+        w = FakeWorker("serienstream.to", [episodes(5, 0), episodes(5, 0)], mark_effect=refuse_second)
+        outcome = await w.mark_season("x", 1, ACTION_WATCHED)
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.note, "POST refused")
+        self.assertEqual(outcome.marks, 1, "only a mark that went through is counted")
+
+    async def test_an_unreadable_page_after_the_second_mark_is_unverified(self):
+        w = FakeWorker("serienstream.to", [episodes(5, 0), episodes(5, 0), RuntimeError("error page 502")])
+        outcome = await w.mark_season("x", 1, ACTION_WATCHED)
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.note, "unverified: error page 502")
+        self.assertEqual(outcome.marks, 2)
 
 
 # ==================== episode 0 placeholders ====================
@@ -647,7 +725,7 @@ class TestEpisodeZero(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(outcome.ok)
 
     async def test_an_unlisted_placeholder_is_named_in_the_failure(self):
-        w = self.worker([numbered((0, False), (1, False)), numbered((0, False), (1, True))])
+        w = self.worker([numbered((0, False), (1, False))] + [numbered((0, False), (1, True))] * 2)
         outcome = await w.mark_season("x", 1, ACTION_WATCHED)
         self.assertFalse(outcome.ok)
         self.assertIn("episode 0 will not stay watched", outcome.note)
@@ -660,6 +738,59 @@ class TestEpisodeZero(unittest.IsolatedAsyncioTestCase):
         outcome = await w.mark_season("x", 1, ACTION_WATCHED)
         self.assertTrue(outcome.ok)
         self.assertIsNone(outcome.episode_zero(ACTION_WATCHED))
+
+
+class TestOnlyEpisodeZeroIsOfferedForTheIgnoreList(unittest.IsolatedAsyncioTestCase):
+    """The ignore list is for one thing: an episode 0 placeholder that takes a
+    mark and never shows it. A normal episode that fails to mark, or a mark
+    that fails as a whole, is a failure to see and retry -- never something
+    to hide behind an ignore entry."""
+
+    HINT = "if it is a placeholder, add"
+
+    async def _mark(self, after, action=ACTION_WATCHED):
+        before = [(n, action != ACTION_WATCHED) for n in range(8)]
+        # The second mark sees the same page: it did not help either.
+        w = FakeWorker("serienstream.to", [numbered(*before), numbered(*after), numbered(*after)])
+        w._ignored_seasons = frozenset()
+        outcome = await w.mark_season("show", 1, action)
+        result = SeriesResult("serienstream.to", "sto", "u", "show", action=action, title="Show", seasons=[outcome])
+        out = io.StringIO()
+        with redirect_stdout(out):
+            main._print_run_summary(main.RunReport(total_urls=1, failed=1), [result])
+        return outcome, out.getvalue()
+
+    async def test_a_normal_episode_that_did_not_stick_is_never_offered(self):
+        outcome, summary = await self._mark([(n, n != 7) for n in range(8)])
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.note, "expected 8/8 after watched, got 7 (marked twice)")
+        self.assertIsNone(outcome.episode_zero(ACTION_WATCHED))
+        self.assertNotIn(self.HINT, summary)
+        self.assertNotIn("EPISODE 0", summary)
+
+    async def test_a_mark_that_failed_as_a_whole_is_not_offered(self):
+        outcome, summary = await self._mark([(n, False) for n in range(8)])
+        self.assertFalse(outcome.ok)
+        self.assertNotIn("episode 0 will not stay watched", outcome.note)
+        note = outcome.episode_zero(ACTION_WATCHED)
+        self.assertEqual(note.kind, "mark failed")
+        self.assertFalse(note.attention, "the season's own failure is the thing to look at")
+        self.assertNotIn(self.HINT, summary)
+
+    async def test_episode_zero_alone_not_sticking_is_offered(self):
+        outcome, summary = await self._mark([(n, n != 0) for n in range(8)])
+        self.assertIn("episode 0 will not stay watched", outcome.note)
+        self.assertEqual(outcome.episode_zero(ACTION_WATCHED).kind, "unlisted")
+        self.assertIn(self.HINT + ' {"slug": "show", "season": "1"}', summary)
+
+    async def test_episode_zero_staying_watched_on_unwatch_is_not_offered(self):
+        # A placeholder shows unwatched whatever is done to it, so this is
+        # something else and an ignore entry would not explain it.
+        outcome, summary = await self._mark([(n, n == 0) for n in range(8)], action=ACTION_UNWATCHED)
+        note = outcome.episode_zero(ACTION_UNWATCHED)
+        self.assertEqual(note.kind, "check")
+        self.assertTrue(note.attention)
+        self.assertNotIn(self.HINT, summary)
 
 
 class TestEpisodeZeroInTheCli(unittest.TestCase):
@@ -1885,11 +2016,79 @@ class TestBatchRewritersKeepThePermanentSection(SectionCase, unittest.IsolatedAs
         await self._paste(pasted, "x", "a")
         self.assertEqual(self.urls(), ["https://serienstream.to/serie/old", pasted])
 
-    async def test_with_no_temporary_urls_there_is_nothing_to_ask(self):
+    async def test_with_no_temporary_urls_add_and_run_once_are_offered(self):
         self.write(self.KEEP, "https://serienstream.to/serie/keepme")
         pasted = "https://serienstream.to/serie/fresh"
-        await self._paste(pasted)  # a second input() call would raise StopIteration
+        with redirect_stdout(io.StringIO()) as out:
+            await self._paste(pasted, "a")
         self.assertEqual(self.urls(), [pasted, "https://serienstream.to/serie/keepme"])
+        self.assertIn("r  run it once now", out.getvalue())
+        self.assertNotIn("o  overwrite", out.getvalue(), "there is nothing to overwrite")
+
+    async def test_overwrite_is_not_accepted_when_there_is_nothing_to_overwrite(self):
+        self.write(self.KEEP, "https://serienstream.to/serie/keepme")
+        before = self.read()
+        with redirect_stdout(io.StringIO()):
+            await self._paste("https://serienstream.to/serie/fresh", "o", "")
+        self.assertEqual(self.read(), before)
+
+    # ---- option 5, "run it once" ----
+
+    async def _run_once(self, *answers, resolved=None):
+        pasted = answers[0]
+        resolved = {"serienstream.to": [pasted]} if resolved is None else resolved
+        with (
+            mock.patch.object(main, "_resolve_hosts", mock.AsyncMock(return_value=(resolved, {}, {}, {}))),
+            mock.patch.object(main, "run_action", mock.AsyncMock()) as run,
+            redirect_stdout(io.StringIO()) as out,
+        ):
+            result = await self._paste(*answers)
+        return run, result, out.getvalue()
+
+    async def test_run_once_marks_the_url_without_writing_it_anywhere(self):
+        self.write("https://serienstream.to/serie/old", self.KEEP, "https://serienstream.to/serie/keepme")
+        before = self.read()
+        pasted = "https://serienstream.to/serie/fresh"
+        run, result, _out = await self._run_once(pasted, "r", "w")
+        run.assert_awaited_once_with(ACTION_WATCHED, {"serienstream.to": [pasted]}, [])
+        self.assertEqual(self.read(), before, "the batch file is not touched")
+        self.assertEqual(result, self.path, "the active batch stays what it was")
+
+    async def test_run_once_can_mark_unwatched_and_works_with_an_empty_working_list(self):
+        self.write(self.KEEP, "https://serienstream.to/serie/keepme")
+        before = self.read()
+        pasted = "https://serienstream.to/serie/fresh"
+        run, _result, _out = await self._run_once(pasted, "r", "u")
+        run.assert_awaited_once_with(ACTION_UNWATCHED, {"serienstream.to": [pasted]}, [])
+        self.assertEqual(self.read(), before)
+
+    async def test_enter_at_the_watched_or_unwatched_question_runs_nothing(self):
+        self.write("https://serienstream.to/serie/old")
+        before = self.read()
+        run, _result, _out = await self._run_once("https://serienstream.to/serie/fresh", "r", "")
+        run.assert_not_awaited()
+        self.assertEqual(self.read(), before)
+
+    async def test_run_once_with_no_reachable_mirror_marks_nothing(self):
+        self.write("https://serienstream.to/serie/old")
+        run, _result, out = await self._run_once("https://serienstream.to/serie/fresh", "r", "w", resolved={})
+        run.assert_not_awaited()
+        self.assertIn("no reachable sto mirror", out)
+
+    async def test_run_once_moves_to_the_working_mirror_in_memory_only(self):
+        self.write("https://serienstream.to/serie/old")
+        before = self.read()
+        pasted = "https://serienstream.cx/serie/fresh"
+        with (
+            mock.patch.object(
+                main, "check_hosts", mock.AsyncMock(side_effect=lambda hosts: dict.fromkeys(hosts, "OK"))
+            ),
+            mock.patch.object(main, "run_action", mock.AsyncMock()) as run,
+            redirect_stdout(io.StringIO()),
+        ):
+            await self._paste(pasted, "r", "w")
+        run.assert_awaited_once_with(ACTION_WATCHED, {"serienstream.to": ["https://serienstream.to/serie/fresh"]}, [])
+        self.assertEqual(self.read(), before)
 
     async def test_pasting_an_unsupported_url_changes_nothing(self):
         self.write("https://old", self.KEEP, "https://keepme")

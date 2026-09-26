@@ -108,7 +108,7 @@ Each host is pinged once; unreachable hosts are skipped, and reachable family mi
 2. Mark as **UNWATCHED**
 3. Export URLs to scraper lists
 4. Import URLs from scraper lists
-5. Add link / change batch
+5. Add or run a link / change batch
 6. Retry failed URLs
 7. Clear temporary entries
 8. Exit
@@ -149,6 +149,7 @@ The marker is a comment, so a batch file using neither mechanism still works exa
 A season counts as successful only when the episode page, re-read after the request, actually shows the target state:
 
 - Every mark is verified by re-fetching the season page, whether a request was sent or the season was already at the target state. These sites answer `HTTP 200` even when nothing changed, so the response status alone proves nothing.
+- A mark that did not stick is sent **once more** and read back again before the season counts as failed, so a lost mark is recovered and a failure is a real one. A season that needed it says `stuck on the second mark`; one that failed both times says `(marked twice)`. There is never a third mark, and a season that needed no mark, or whose only miss is a listed episode 0, gets no second one.
 - A season page where no episode rows can be parsed is reported as **failed** (`no episodes found`), never as a silent success — an unreadable page means the result cannot be verified.
 - If verification itself fails (network error, error page), the season is reported as **unverified** and lands in the retry list. Re-running is safe: a season already at the target state issues no request.
 - `✓` is action-aware: a fully _unwatched_ series is a success at 0 watched episodes.
@@ -193,7 +194,8 @@ details.
 
 While the program is running, select **5** to:
 
-- Paste a single URL → if the batch already has temporary entries, you are asked whether to **add** the URL to them (`a`) or **overwrite** them with it (`o`); Enter cancels. Either way the keep block and any `-`-tagged line stay. Adding a series that is already in the batch, on any mirror or season, changes nothing.
+- Paste a single URL → you are asked whether to **add** the URL to the batch's temporary entries (`a`), **overwrite** them with it (`o`, offered when there are any), or **run it once** (`r`); Enter cancels. Adding or overwriting keeps the keep block and any `-`-tagged line. Adding a series that is already in the batch, on any mirror or season, changes nothing.
+- **Run it once** asks whether to mark the URL watched (`w`) or unwatched (`u`) and runs it straight away, with the same preview, confirmation and verification as a batch run. It is written to no batch file and the active batch stays as it was; only a failure is recorded, for option 6, like any other.
 - Enter a file path → switches the current batch to that file.
 
 ### Importing URLs from scraper lists (option 4)

@@ -650,7 +650,26 @@ async def resolve_active_hosts(
     # and parsed it again, which also logged every duplicate-URL notice
     # a second time.
     grouped, _rejected = preloaded if preloaded is not None else load_url_batches(urls_file)
+    resolved, statuses, active_host_by_family, rewrites = await _resolve_hosts(grouped)
 
+    if rewrites and _rewrite_batch_urls(urls_file, rewrites):
+        print(f"\n  → rewritten {len(rewrites)} URL(s) to active hosts:")
+        for old, new in rewrites.items():
+            print(f"    {old} -> {new}")
+        logger.info("Rewrote %d URL(s) in %s", len(rewrites), urls_file)
+
+    return resolved, statuses, active_host_by_family
+
+
+async def _resolve_hosts(
+    grouped: dict[str, list[str]],
+) -> tuple[dict[str, list[str]], dict[str, str], dict[str, str], dict[str, str]]:
+    """Move URLs grouped by host onto one reachable host per family, touching no file.
+
+    Returns ``(resolved, statuses, active_host_by_family, rewrites)``;
+    ``rewrites`` maps each URL that moved to its new form, for a caller that
+    keeps them in a batch file.
+    """
     families_in_batch = {SUPPORTED_DOMAINS[host] for host in grouped if host in SUPPORTED_DOMAINS}
     hosts_to_check = [host for host in DOMAIN_ORDER if SUPPORTED_DOMAINS.get(host) in families_in_batch]
     statuses = await check_hosts(hosts_to_check)
@@ -709,13 +728,7 @@ async def resolve_active_hosts(
             unique.append(url)
         resolved[host] = unique
 
-    if rewrites and _rewrite_batch_urls(urls_file, rewrites):
-        print(f"\n  → rewritten {len(rewrites)} URL(s) to active hosts:")
-        for old, new in rewrites.items():
-            print(f"    {old} -> {new}")
-        logger.info("Rewrote %d URL(s) in %s", len(rewrites), urls_file)
-
-    return resolved, statuses, active_host_by_family
+    return resolved, statuses, active_host_by_family, rewrites
 
 
 # ==================== RESULT MODEL ====================
@@ -739,6 +752,9 @@ class SeasonOutcome:
     listed: bool = False
     ep0_before: bool | None = None
     ep0_after: bool | None = None
+    # Season marks sent in this run: 0 when it was already at target, 2 when
+    # the first did not stick and it was marked once more.
+    marks: int = 0
 
     def target(self, action: str) -> int:
         if action == ACTION_WATCHED:
@@ -808,19 +824,37 @@ class SeasonOutcome:
                 False,
                 f"episode 0 did not stay {wanted} — a known placeholder (ignore list), not counted",
             )
+        # Unlisted, so episode 0 is in the counts. It is a placeholder
+        # candidate only when it is the one episode off target after marking
+        # watched -- the same test mark_season's note applies. If other
+        # episodes failed too, the mark failed as a whole, and suggesting an
+        # ignore entry would hide a real failure behind a placeholder.
+        only_zero_off = abs(self.target(action) - self.watched_after) == 1
+        if want and only_zero_off:
+            return EpisodeZeroNote(
+                "unlisted", True, "episode 0 did not stay watched and is not on the ignore list — check it"
+            )
+        if only_zero_off:
+            return EpisodeZeroNote(
+                "check", True, f"episode 0 did not stay {wanted} although every other episode did — check it"
+            )
         return EpisodeZeroNote(
-            "unlisted", True, f"episode 0 did not stay {wanted} and is not on the ignore list — check it"
+            "mark failed",
+            False,
+            f"episode 0 did not stay {wanted}, nor did other episodes — the season's mark failed, not a placeholder",
         )
 
 
 # Short forms for one-line output; a kind not named here is its own tag.
+# Only "unlisted" -- episode 0 the one episode that would not stay watched --
+# gets the "add it to the ignore list" hint in the run summary.
 _EP0_TAGS = {"unlisted": "not listed", "stale": "stale entry"}
 
 
 class EpisodeZeroNote(NamedTuple):
     """One season's episode 0 finding, for the CLI."""
 
-    kind: str  # placeholder, sticks, unlisted or stale
+    kind: str  # placeholder, sticks, unlisted, check, mark failed or stale
     attention: bool  # worth investigating, not only worth knowing
     text: str
 
@@ -1616,57 +1650,55 @@ class DomainWorker:
         outcome.listed = listed
         outcome.ep0_before = outcome.ep0_after = ep0
 
-        target = total if action == ACTION_WATCHED else 0
         if not outcome.needs_mark(action):
             logger.info("Skipping mark for %s season %s (already %s)", slug, season, action)
         else:
             # A listed episode 0 is marked like the rest even though it does
             # not count: that is the only way to see whether it still refuses
             # to stick, or has started to and no longer belongs on the list.
-            try:
-                try:
-                    await self._issue_mark(soup, season_url, slug, season, action)
-                except ControlMissingError as exc:
-                    if not await self._recover_session():
-                        raise
-                    soup = await self._get_soup(season_url)
-                    logger.info("Retrying mark for %s season %s after re-login (%s)", slug, season, exc)
-                    await self._issue_mark(soup, season_url, slug, season, action)
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("Failed marking %s season %s: %s", slug, season, exc)
-                outcome.ok = False
-                outcome.note = str(exc)
+            if not await self._mark_or_fail(outcome, soup, season_url, slug, season, action):
                 return outcome
 
         # Always verify against a freshly fetched page — for a skipped mark and
         # for an issued one alike. An HTTP 200 from these sites does not prove
         # the state actually changed.
-        try:
-            after_doc = await self._get_soup(season_url)
-        except Exception as exc:  # noqa: BLE001
-            outcome.ok = False
-            outcome.note = f"unverified: {exc}"
-            logger.error("Could not verify season %s of %s: %s", season, slug, exc)
+        after_doc = await self._read_back(outcome, season_url, slug, season)
+        if after_doc is None:
             return outcome
-        after, after_total = self._count_episodes(after_doc, listed)
-        outcome.ep0_after = self._episode_zero_watched(after_doc)
-        self._log_episode_zero(slug, season, outcome, action)
+        after, target = self._settle_counts(outcome, after_doc, listed, action, slug, season)
 
-        if after_total and after_total != total:
+        if after != target and outcome.marks:
+            # A mark the site answered with 200 does not always land. One more
+            # mark and read-back before calling it a failure: a mark that was
+            # merely lost then succeeds, and one that fails twice is a real
+            # failure, not a fluke. It costs one POST, and only for a season a
+            # mark already left off target -- a listed episode 0 is not counted,
+            # so a known placeholder never triggers it.
             logger.warning(
-                "Episode count for %s season %s changed during marking: %d -> %d",
+                "Mark for %s season %s did not stick (%d/%d, expected %d); marking once more",
                 slug,
                 season,
-                total,
-                after_total,
+                after,
+                outcome.total,
+                target,
             )
-            outcome.total = after_total
-            target = after_total if action == ACTION_WATCHED else 0
+            if not await self._mark_or_fail(outcome, after_doc, season_url, slug, season, action):
+                return outcome
+            after_doc = await self._read_back(outcome, season_url, slug, season)
+            if after_doc is None:
+                return outcome
+            after, target = self._settle_counts(outcome, after_doc, listed, action, slug, season)
+            if after == target:
+                outcome.note = "stuck on the second mark"
+                logger.info("Second mark for %s season %s stuck", slug, season)
 
+        outcome.ep0_after = self._episode_zero_watched(after_doc)
         outcome.watched_after = after
+        self._log_episode_zero(slug, season, outcome, action)
         if after != target:
             outcome.ok = False
-            outcome.note = f"expected {target}/{outcome.total} after {action}, got {after}"
+            marked_twice = " (marked twice)" if outcome.marks > 1 else ""
+            outcome.note = f"expected {target}/{outcome.total} after {action}, got {after}{marked_twice}"
             logger.error(
                 "Verification failed for %s season %s: %d/%d watched, expected %d",
                 slug,
@@ -1689,6 +1721,61 @@ class DomainWorker:
                     IGNORED_SEASONS_FILES.get(self.family) or "the scraper's .ignored_seasons.json",
                 )
         return outcome
+
+    async def _mark_or_fail(
+        self, outcome: SeasonOutcome, doc, season_url: str, slug: str, season: int | str, action: str
+    ) -> bool:
+        """Send one season mark, logging back in once if the control is missing.
+
+        Counts the mark in ``outcome.marks``. On failure the outcome is marked
+        failed with the reason, and False is returned.
+        """
+        try:
+            try:
+                await self._issue_mark(doc, season_url, slug, season, action)
+            except ControlMissingError as exc:
+                if not await self._recover_session():
+                    raise
+                doc = await self._get_soup(season_url)
+                logger.info("Retrying mark for %s season %s after re-login (%s)", slug, season, exc)
+                await self._issue_mark(doc, season_url, slug, season, action)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed marking %s season %s: %s", slug, season, exc)
+            outcome.ok = False
+            outcome.note = str(exc)
+            return False
+        outcome.marks += 1
+        return True
+
+    async def _read_back(self, outcome: SeasonOutcome, season_url: str, slug: str, season: int | str):
+        """Fetch the season page again to see what a mark did; None if it cannot be read."""
+        try:
+            return await self._get_soup(season_url)
+        except Exception as exc:  # noqa: BLE001
+            outcome.ok = False
+            outcome.note = f"unverified: {exc}"
+            logger.error("Could not verify season %s of %s: %s", season, slug, exc)
+            return None
+
+    def _settle_counts(
+        self, outcome: SeasonOutcome, doc, listed: bool, action: str, slug: str, season: int | str
+    ) -> tuple[int, int]:
+        """Return (watched, target) as a read-back page shows them.
+
+        A season that gained or lost episodes while it was being marked is
+        judged by the new count.
+        """
+        after, after_total = self._count_episodes(doc, listed)
+        if after_total and after_total != outcome.total:
+            logger.warning(
+                "Episode count for %s season %s changed during marking: %d -> %d",
+                slug,
+                season,
+                outcome.total,
+                after_total,
+            )
+            outcome.total = after_total
+        return after, outcome.total if action == ACTION_WATCHED else 0
 
     @staticmethod
     def _log_episode_zero(slug: str, season: int | str, outcome: SeasonOutcome, action: str) -> None:
@@ -2254,7 +2341,7 @@ def print_menu(
     print("    2  mark as UNWATCHED")
     print("    3  export URLs to scraper lists")
     print("    4  import URLs from scraper lists")
-    print("    5  add link / change batch")
+    print("    5  add or run a link / change batch")
     print("    6  retry failed URLs")
     print("    7  clear temporary entries")
     print("    0  exit")
@@ -2774,25 +2861,75 @@ async def retry_failed_urls(urls_file: str) -> str:
     return RETRY_BATCH_FILE
 
 
-def _ask_add_or_overwrite(temporary_count: int, permanent_count: int) -> str | None:
-    """Ask whether a pasted URL joins the working list or replaces it.
+def _ask_paste_mode(temporary_count: int, permanent_count: int) -> str | None:
+    """Ask what a pasted URL is for: join the working list, replace it, or run once.
 
-    Enter cancels rather than picking either: one of the two throws the
-    current list away, so neither is a safe thing to do on a stray keypress.
+    "once" marks the URL straight away and writes it to no batch file. It is
+    offered even when the working list is empty, which is why this is asked
+    then too; overwriting is only offered when there is something to replace.
+
+    Enter cancels rather than picking any: overwriting throws the current
+    list away, so no answer is a safe thing to do on a stray keypress.
     """
     kept = f"; the {permanent_count} permanent entrie(s) stay either way" if permanent_count else ""
-    print(f"\n  the batch already has {temporary_count} temporary URL(s){kept}.")
-    print("    a  add this URL to them")
-    print("    o  overwrite them with this URL")
+    if temporary_count:
+        print(f"\n  the batch already has {temporary_count} temporary URL(s){kept}.")
+        print("    a  add this URL to them")
+        print("    o  overwrite them with this URL")
+    else:
+        print(f"\n  the batch has no temporary URLs{kept}.")
+        print("    a  add this URL to the batch")
+    print("    r  run it once now — it is not added to any batch file")
+    keys = "a/o/r" if temporary_count else "a/r"
     while True:
-        choice = input("  [a/o, Enter cancels]: ").strip().lower()
+        choice = input(f"  [{keys}, Enter cancels]: ").strip().lower()
         if not choice:
             return None
         if choice in ("a", "add"):
             return "add"
-        if choice in ("o", "overwrite"):
+        if temporary_count and choice in ("o", "overwrite"):
             return "overwrite"
-        print("  please answer a or o.")
+        if choice in ("r", "run"):
+            return "once"
+        print(f"  please answer {'a, o or r' if temporary_count else 'a or r'}.")
+
+
+def _ask_one_off_action() -> str | None:
+    """Ask whether a one-off URL is marked watched or unwatched; None cancels."""
+    print("\n  mark it as:")
+    print("    w  watched")
+    print("    u  unwatched")
+    while True:
+        choice = input("  [w/u, Enter cancels]: ").strip().lower()
+        if not choice:
+            return None
+        if choice in ("w", "watched"):
+            return ACTION_WATCHED
+        if choice in ("u", "unwatched"):
+            return ACTION_UNWATCHED
+        print("  please answer w or u.")
+
+
+async def _run_url_once(url: str, classification: tuple[str, str, str]) -> None:
+    """Mark one pasted URL now, without writing it to any batch file.
+
+    It goes through the same preview, confirmation and verification as a
+    batch run, and a failure is recorded for option 6 like any other. The
+    host check covers only this URL's family, and a mirror move stays in
+    memory: there is no batch line to rewrite.
+    """
+    action = _ask_one_off_action()
+    if action is None:
+        print("  cancelled.")
+        return
+    host, family, _slug = classification
+    print("\n  → checking hosts ...")
+    resolved, _statuses, _active, _rewrites = await _resolve_hosts({host: [url]})
+    if not resolved:
+        print(f"  ✗ no reachable {family} mirror — nothing was marked.")
+        return
+    logger.info("One-off run (%s) for %s, not added to any batch", action, url)
+    await run_action(action, resolved, [])
 
 
 def _batch_entry_for_series(path: str, classification: tuple[str, str, str]) -> str | None:
@@ -2815,7 +2952,8 @@ async def _detect_and_add_input(urls_file: str) -> str:
     """Scraper-style input: detect URL, existing file path, or file name."""
     print("\n  add link / change batch")
     print(f"  current file: {urls_file}")
-    print("  • Paste URL      → adds it to, or overwrites, the default batch's temporary URLs")
+    print("  • Paste URL      → adds it to, or overwrites, the default batch's temporary URLs,")
+    print("                     or runs it once without adding it anywhere")
     print("  • Enter path     → switches to that batch file")
     print("  • Press Enter    → cancel\n")
 
@@ -2830,12 +2968,14 @@ async def _detect_and_add_input(urls_file: str) -> str:
             print(f"  ✗ not a supported series URL: {user_input}")
             return urls_file
         temporary_count, permanent_count = _batch_section_counts(DEFAULT_BATCH_FILE)
-        mode = "add"
-        if temporary_count:
-            mode = _ask_add_or_overwrite(temporary_count, permanent_count)
-            if mode is None:
-                print("  cancelled.")
-                return urls_file
+        mode = _ask_paste_mode(temporary_count, permanent_count)
+        if mode is None:
+            print("  cancelled.")
+            return urls_file
+        if mode == "once":
+            # The active batch stays what it was; nothing is written to it.
+            await _run_url_once(user_input, classification)
+            return urls_file
         if mode == "add":
             existing = _batch_entry_for_series(DEFAULT_BATCH_FILE, classification)
             if existing:
