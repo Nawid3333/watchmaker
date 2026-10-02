@@ -45,6 +45,7 @@ import logging
 import os
 import re
 import sys
+from collections.abc import Iterable
 
 
 class Style:
@@ -218,6 +219,50 @@ def prompt(text: str) -> str:
 def cinput(text: str = "") -> str:
     """`input` that dims the hint. A pre-styled prompt is passed through."""
     return input(prompt(text))
+
+
+# How many unusable answers in a row one prompt takes before it stops asking
+# and returns its safe answer. A few are typos; an endless run is an
+# unattended feed -- a piped command, a scripted test -- that would otherwise
+# be asked forever. The same limit the sibling scrapers use.
+MAX_UNRECOGNIZED = 5
+
+
+def ask(text: str, choices: Iterable[str], *, safe: str, hint: str = "") -> str:
+    """Ask *text* until the answer is one of *choices*; return it lowercased.
+
+    Only what the prompt offers is accepted -- no synonyms, no guessing. The
+    old prompts here took "yes" and "no" as well as y and n, and the add/run
+    question took whole words; a prompt that accepts more than it shows is
+    one where a typo can land on an answer nobody chose.
+
+    There are no defaults: Enter alone is asked again like any other unusable
+    answer. End of input, or MAX_UNRECOGNIZED unusable answers in a row, give
+    *safe*: the answer that changes nothing. End of input used to escape as
+    an EOFError traceback out of the whole program.
+    """
+    valid = {choice.lower() for choice in choices}
+    hint = hint or "type one of " + ", ".join(sorted(valid))
+    for _ in range(MAX_UNRECOGNIZED):
+        try:
+            answer = cinput(text).strip().lower()
+        except EOFError:
+            cprint(f"  -> No input available; answering {safe!r}.")
+            return safe
+        if answer in valid:
+            return answer
+        cprint(f"  ⚠ {repr(answer) + ' is not an option' if answer else 'No answer'} - {hint}.")
+    cprint(f"  ⚠ No usable answer after {MAX_UNRECOGNIZED} tries; answering {safe!r}.")
+    return safe
+
+
+def confirm(text: str) -> bool:
+    """Ask a y/n question until it is answered y or n (either case).
+
+    Nothing else counts, Enter included: an answer is never assumed. End of
+    input, or a run of unusable answers, counts as no.
+    """
+    return ask(text, ("y", "n"), safe="n", hint="type y or n") == "y"
 
 
 # Ordered longest-prefix-first so "✅" is tested before "✓" would ever matter

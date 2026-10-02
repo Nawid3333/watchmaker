@@ -4,7 +4,7 @@ Batch mark whole series as watched or unwatched on the aniworld.to, bs.to family
 
 Each reachable host gets its own worker — all hosts log in and run at once — and each worker discovers every season of its host's series URLs, strictly one series at a time, invoking the site's native "mark all episodes in this season" control.
 
-When marking a series as **WATCHED** on the aniworld or s.to family, watchmaker also subscribes to the series first (if the subscribe control is present and not already active). The bs.to family has no subscribe control, so this step is skipped there.
+When marking a series as **WATCHED** on the aniworld or s.to family, watchmaker also subscribes to the series first (if it is not already subscribed). The subscribe controls are toggles, so the request is sent once and never resent blind; the series page read after marking decides, and a series that did not end up subscribed — or whose page has no subscribe control — is reported as failed. The bs.to family has no subscribe control, so this step is skipped there.
 
 ## Supported hosts
 
@@ -45,7 +45,7 @@ BeautifulSoup, and HTTP/2 lets one connection carry many requests.
    cp .env.example .env
    ```
 
-3. Add series URLs to the default batch file (`series_urls.txt`), one per line. Lines starting with `#` are ignored. Two URLs pointing at the same series (for example `/serie/x` and `/serie/x/staffel-3`) mark the same thing, so only the first is used. To keep some entries around permanently instead of clearing them with option 7, see [The batch file has two parts](#the-batch-file-has-two-parts) below.
+3. Add series URLs to the default batch file (`series_urls.txt`), one per line. Lines starting with `#` are ignored. Two URLs pointing at the same series (for example `/serie/x` and `/serie/x/staffel-3`) mark the same thing, so only the first is used: a season or episode in a URL is ignored and the whole series is marked, which the preview points out for every such URL. Batch files are read as UTF-8 (a BOM is fine); a file in another encoding is refused with a message rather than guessed at. To keep some entries around permanently instead of clearing them with option 7, see [The batch file has two parts](#the-batch-file-has-two-parts) below.
 
 ### Install it as a command
 
@@ -139,7 +139,7 @@ Everything else — no marker below it, no `-` in front of it — is temporary.
 
 - **Option 7** clears temporary entries — URLs only. Your own comments and blank lines are left alone, and it shows you exactly what will go before asking.
 - Adding URLs (option 5, or importing with option 4) inserts them **above** the marker, untagged, so new series always land in the working list.
-- Retrying failed URLs (option 6), and pasting a single URL with option 5 when you choose to overwrite, replace the temporary entries only; the keep block and any `-`-tagged line are left alone.
+- Pasting a single URL with option 5 and choosing to overwrite replaces the temporary entries only; the keep block and any `-`-tagged line are left alone. The entries it would remove are listed first, and nothing changes without a `y`.
 - Permanent does **not** mean skipped: both kinds of permanent entries are still marked by options 1 and 2 like any other. Neither one controls anything but what option 7 removes.
 
 The marker is a comment, so a batch file using neither mechanism still works exactly as before — everything in it simply counts as temporary. It's matched loosely (`# KEEP …`, any spacing, casing, or number of `=`), because it is meant to be edited by hand.
@@ -151,9 +151,12 @@ A season counts as successful only when the episode page, re-read after the requ
 - Every mark is verified by re-fetching the season page, whether a request was sent or the season was already at the target state. These sites answer `HTTP 200` even when nothing changed, so the response status alone proves nothing.
 - A mark that did not stick is sent **once more** and read back again before the season counts as failed, so a lost mark is recovered and a failure is a real one. A season that needed it says `stuck on the second mark`; one that failed both times says `(marked twice)`. There is never a third mark, and a season that needed no mark, or whose only miss is a listed episode 0, gets no second one.
 - A season page where no episode rows can be parsed is reported as **failed** (`no episodes found`), never as a silent success — an unreadable page means the result cannot be verified.
-- If verification itself fails (network error, error page), the season is reported as **unverified** and lands in the retry list. Re-running is safe: a season already at the target state issues no request.
+- If verification itself fails (network error, error page), the season is reported as **unverified** and lands in the retry list. So is a read-back page that lists no episodes, lists fewer episodes than before marking, or shows no logged-in session: each of those would read as "0 watched", which is exactly what an unwatch run aims for. Re-running is safe: a season already at the target state issues no request.
+- Every page whose counts are used — in the preview and when marking — has to show the logged-in session. A page that does not is never counted: watchmaker logs in again and reads it once more, and fails the season if it still shows no session.
+- The failures of a run are listed in full under **FAILED** in the run summary, one reason per season, and next to each series as it finishes.
 - `✓` is action-aware: a fully _unwatched_ series is a success at 0 watched episodes.
-- If a session expires mid-batch, watchmaker re-authenticates once and retries that season before giving up.
+- If a session expires mid-batch — a missing control, a logged-out answer from bs.to's mark link, or a `401`/`419` to a mark — watchmaker re-authenticates once and retries that season before giving up.
+- Series whose site has no reachable mirror are reported as not attempted and recorded for option 6. If a run is interrupted with Ctrl+C, the series it had not finished are recorded too.
 - A retired or mistyped slug is answered by these sites with the catalogue page at `HTTP 200`. Such a page is rejected by name (`Alle Serien`, `Andere Serien`, ...) instead of being marked as if it were a real series.
 - Some seasons carry an **episode 0** placeholder that the site accepts a mark for and then never shows as watched. Seasons listed in a scraper's `data/.ignored_seasons.json` (found next to the `SERIES_URLS_EXPORTS` file for that family) have episode 0 left out of the count, exactly as the scraper does, so it never decides `✓` or `✗`. It is still marked and re-checked every run, and every episode 0 met is shown in the CLI: in the preview, as `· E0: S1 placeholder` on the result line, and in full in the `EPISODE 0` block of the run summary. That block flags, with the fix to make:
   - an **unlisted** episode 0 that did not stick (the season fails; the entry to add is printed),
@@ -194,9 +197,12 @@ details.
 
 While the program is running, select **5** to:
 
-- Paste a single URL → you are asked whether to **add** the URL to the batch's temporary entries (`a`), **overwrite** them with it (`o`, offered when there are any), or **run it once** (`r`); Enter cancels. Adding or overwriting keeps the keep block and any `-`-tagged line. Adding a series that is already in the batch, on any mirror or season, changes nothing.
+- Paste a single URL → you are asked whether to **add** the URL to the batch's temporary entries (`a`), **overwrite** them with it (`o`, offered when there are any), or **run it once** (`r`), or cancel (`c`). Adding or overwriting keeps the keep block and any `-`-tagged line. Adding a series that is already in the batch, on any mirror or season, changes nothing.
 - **Run it once** asks whether to mark the URL watched (`w`) or unwatched (`u`) and runs it straight away, with the same preview, confirmation and verification as a batch run. It is written to no batch file and the active batch stays as it was; only a failure is recorded, for option 6, like any other.
-- Enter a file path → switches the current batch to that file.
+- Enter a file path → switches the current batch to that file (quotes around the path are fine). Only a readable UTF-8 file is accepted.
+- Type `0` to go back to the menu.
+
+Every prompt takes only the answers it lists — `y`/`n` in either case, or the letters and numbers shown. Enter alone is never an answer, and anything else is asked again with what is allowed. End of input, or five unusable answers in a row, gives the answer that changes nothing.
 
 ### Importing URLs from scraper lists (option 4)
 
@@ -266,7 +272,7 @@ Directories created at runtime (`data/`, `logs/`), your `.env`, and your
 
 ## Outputs
 
-- `data/.failed_urls.json` — URLs that failed, so they can be retried. Each entry records which action (WATCHED/UNWATCHED) it failed under, so a success in one action never silently erases a failure recorded under the other for the same URL. Only URLs actually attempted in a run are reconciled, so failures recorded by an earlier run against a different batch are never silently dropped. Option 6 shows which action each failure came from and which menu option to retry it with.
+- `data/.failed_urls.json` — URLs that failed, so they can be retried. Each entry records which action (WATCHED/UNWATCHED) it failed under, so a success in one action never silently erases a failure recorded under the other for the same URL. Only series actually attempted in a run are reconciled, so failures recorded by an earlier run against a different batch are never silently dropped. Entries are matched by series, not by URL, so a failure on one mirror is cleared by a success on another. Option 6 shows which action each failure came from and retries one action's failures at a time: it writes them to `data/retry_batch.txt` under a first line naming that action, and the menu refuses the other action on that batch.
 - `logs/watchmaker.log` — detailed debug log.
 
 ## Author

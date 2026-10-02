@@ -28,6 +28,12 @@ STO_SEASON = """<html><head><meta name="csrf-token" content="tok"></head><body>
 ANIWORLD_SEASON = """<html><body><div class="add-series" data-series-id="42"></div>
 <span class="clearAllEpisodesFromThisSeason" data-season-id="7"></span></body></html>"""
 
+# Every family's logged-in chrome, which DomainWorker._is_logged_in looks for:
+# the page a live session is served.
+LOGGED_IN_PAGE = """<html><body><form action="/logout"></form>
+<div class="avatar"><a href="/user/profil/me"></a></div>
+<section class="navigation"><a href="logout">Logout</a></section></body></html>"""
+
 
 def _doc(html: str):
     doc = main.make_doc(html)
@@ -38,7 +44,7 @@ def _doc(html: str):
 class RecordingWorker(DomainWorker):
     """A DomainWorker that records what it would send instead of sending it."""
 
-    def __init__(self, host: str, response: httpx.Response | None = None, page: str = "<html><body></body></html>"):
+    def __init__(self, host: str, response: httpx.Response | None = None, page: str = LOGGED_IN_PAGE):
         super().__init__(host)
         self.response = response or httpx.Response(200, json={"ok": True, "status": True})
         self.page = page
@@ -119,6 +125,14 @@ class TestBsMarkRequest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(w.gets, [f"https://burningseries.ac/serie/Foo/3/des/{verb}"])
                 self.assertEqual(w.posts, [])
 
+    async def test_a_logged_out_answer_asks_for_a_re_login(self):
+        # bs.to marks by opening a link, so there is no control to go
+        # missing: an expired session just answers with a logged-out page,
+        # which used to pass as a mark and never triggered a re-login.
+        w = RecordingWorker("burningseries.ac", page="<html><body></body></html>")
+        with self.assertRaises(ControlMissingError):
+            await w._issue_mark(_doc("<html></html>"), w.season_url("Foo", 3), "Foo", 3, ACTION_WATCHED)
+
 
 class _NoMarking(RecordingWorker):
     """Records mark_series' decisions without marking any season."""
@@ -169,6 +183,49 @@ class TestMarkSeries(unittest.IsolatedAsyncioTestCase):
         await w.mark_series(_plan("burningseries.ac", "bs"), ACTION_WATCHED)
         self.assertEqual(w.subscribe_calls, 0)
         self.assertEqual(w.seasons_marked, [1, 2])
+
+
+def _series_page(*, subscribed: bool | None) -> str:
+    """A logged-in s.to series page whose favourite button is on, off, or absent."""
+    button = ""
+    if subscribed is not None:
+        active = " btn-glass-primary" if subscribed else ""
+        button = f'<button class="js-action-btn{active}" data-type="favorite" data-url="/fav"></button>'
+    return LOGGED_IN_PAGE.replace("</body>", f"{button}</body>")
+
+
+class TestSubscribeCountsInTheResult(unittest.IsolatedAsyncioTestCase):
+    """The series page read after marking is the subscribe's verification.
+
+    A subscribe that did not take used to leave the series at ✓, with only a
+    Sub:✗ in the result cell and a warning in the log.
+    """
+
+    async def _mark(self, action, *, subscribed):
+        w = _NoMarking("serienstream.to")
+        w.page = _series_page(subscribed=subscribed)
+        return await w.mark_series(_plan("serienstream.to", "sto"), action)
+
+    async def test_a_subscribe_that_took_keeps_the_series_successful(self):
+        result = await self._mark(ACTION_WATCHED, subscribed=True)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.note, "")
+
+    async def test_a_subscribe_that_did_not_take_fails_the_series(self):
+        result = await self._mark(ACTION_WATCHED, subscribed=False)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.note, "not subscribed: the subscribe did not take effect")
+        self.assertFalse(result.line().startswith("✓"))
+
+    async def test_a_missing_subscribe_control_fails_a_watched_run(self):
+        result = await self._mark(ACTION_WATCHED, subscribed=None)
+        self.assertFalse(result.ok)
+        self.assertIn("no subscribe control", result.note)
+
+    async def test_an_unwatched_run_never_fails_on_the_subscription(self):
+        # Unwatching does not subscribe, so the status is only shown.
+        result = await self._mark(ACTION_UNWATCHED, subscribed=False)
+        self.assertTrue(result.ok)
 
 
 class _Clock:
@@ -269,11 +326,65 @@ class TestRateLimitRetry(PacedCase):
         self.assertEqual(self.clock.sleeps, [main._BASE_BACKOFF])
 
 
+class TestSubscribeToggleIsNeverResentBlind(PacedCase):
+    """Both sites' subscribe controls are toggles. A 5xx can arrive after the
+    toggle landed; resending it then unsubscribed the series again, and
+    ensure_subscribed still answered True."""
+
+    async def test_a_server_error_is_not_resent(self):
+        w = self.worker("serienstream.to", 502)
+        with self.assertRaises(httpx.HTTPStatusError):
+            await w._post_once("https://serienstream.to/fav")
+        self.assertEqual(self.clock.sleeps, [], "no backoff, because no second attempt")
+
+    async def test_a_connection_error_is_not_resent(self):
+        sent = []
+
+        def reply(request: httpx.Request) -> httpx.Response:
+            sent.append(request)
+            raise httpx.ReadTimeout("slow", request=request)
+
+        w = DomainWorker("serienstream.to")
+        w.client = httpx.AsyncClient(transport=httpx.MockTransport(reply))
+        self.addAsyncCleanup(w.client.aclose)
+        with self.assertRaises(httpx.ReadTimeout):
+            await w._post_once("https://serienstream.to/fav")
+        self.assertEqual(len(sent), 1)
+
+    async def test_a_429_is_still_waited_out_and_resent(self):
+        # Refused before anything happened, so sending it again is safe.
+        w = self.worker("serienstream.to", 429)
+        r = await w._post_once("https://serienstream.to/fav")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.clock.sleeps, [main._RATE_LIMIT_WAIT])
+
+    async def test_a_toggle_that_landed_before_a_502_stays_on(self):
+        server = {"subscribed": False, "posts": 0}
+
+        def reply(request: httpx.Request) -> httpx.Response:
+            server["posts"] += 1
+            server["subscribed"] = not server["subscribed"]
+            return httpx.Response(502 if server["posts"] == 1 else 200)
+
+        w = DomainWorker("serienstream.to")
+        w.client = httpx.AsyncClient(transport=httpx.MockTransport(reply))
+        self.addAsyncCleanup(w.client.aclose)
+        page = _doc(
+            '<html><head><meta name="csrf-token" content="t"></head><body>'
+            '<a class="js-action-btn" data-type="favorite" data-url="/fav"></a></body></html>'
+        )
+        with self.assertRaises(httpx.HTTPStatusError):
+            await w.ensure_subscribed("https://serienstream.to/serie/x", page)
+        self.assertEqual(server, {"subscribed": True, "posts": 1})
+
+
 class TestRetryAfterParsing(unittest.TestCase):
     def test_seconds_and_http_dates_are_both_understood(self):
         self.assertEqual(main._retry_after_seconds("12"), 12.0)
         soon = main.datetime.now(main.UTC) + timedelta(seconds=30)
-        self.assertAlmostEqual(main._retry_after_seconds(format_datetime(soon, usegmt=True)), 30, delta=2)
+        waited = main._retry_after_seconds(format_datetime(soon, usegmt=True))
+        assert waited is not None
+        self.assertAlmostEqual(waited, 30, delta=2)
 
     def test_nothing_usable_is_none(self):
         for value in (None, "", "soon", "-"):

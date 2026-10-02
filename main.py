@@ -87,6 +87,11 @@ _BASE_BACKOFF = 1.0
 _MAX_BACKOFF = 30.0
 _RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
 _OK_POST_STATUS = frozenset({200, 201, 204, 301, 302})
+# What a mark request gets back when the session behind it is gone: 401 for
+# no session at all, 419 (Laravel's "page expired") for a CSRF token the
+# session no longer accepts. Both mean "log in again and re-read the page",
+# not "this season cannot be marked".
+_SESSION_LOST_STATUS = frozenset({401, 419})
 # Whole login attempts, each from a freshly fetched login page (and so a fresh
 # CSRF token). Only an error is retried; a clean refusal is final.
 _LOGIN_ATTEMPTS = 3
@@ -155,6 +160,24 @@ class ControlMissingError(RuntimeError):
 
     Usually means the session expired and we were served a logged-out page,
     so the caller may re-authenticate and try once more.
+    """
+
+
+class LoggedOutError(RuntimeError):
+    """A page that has to show this account's watch state shows no session.
+
+    A logged-out season page lists every episode as unwatched. Counted, that
+    reads as "already unwatched" -- so an unwatch run against an expired
+    session skipped every season, re-read the same logged-out page and
+    reported each one as a verified success with nothing sent.
+    """
+
+
+class UnreadableListError(Exception):
+    """A batch or scraper list exists but cannot be read as UTF-8 text.
+
+    Raised instead of guessing an encoding: a guess that is wrong turns into
+    mangled URLs and comments the next time the file is written back.
     """
 
 
@@ -489,6 +512,34 @@ def slug_for(url: str, family: str) -> str:
         return urlparse(url).path.split(marker, 1)[1].split("/", 1)[0]
     except IndexError as exc:
         raise ValueError(f"Cannot extract series slug from {url!r}") from exc
+
+
+def _url_below_series(url: str, family: str) -> str:
+    """What a URL names below its series -- "staffel-3/episode-5" -- or "".
+
+    A series is always marked whole, so this part is ignored. It is surfaced
+    in the preview because a pasted episode link reads like a request to mark
+    that one episode, and an unwatch run would then clear every season.
+    """
+    marker = "/anime/stream/" if family == "aniworld" else "/serie/"
+    path = urlparse(url).path
+    if marker not in path:
+        return ""
+    rest = path.split(marker, 1)[1].strip("/")
+    return rest.split("/", 1)[1].strip("/") if "/" in rest else ""
+
+
+def _stranded_urls(grouped: dict[str, list[str]], active_host_by_family: dict[str, str]) -> dict[str, list[str]]:
+    """The batch's URLs whose site family has no reachable mirror, by host.
+
+    _resolve_hosts leaves these out of what it returns, so the caller hands
+    them to run_action separately to be reported rather than lost.
+    """
+    return {
+        host: list(urls)
+        for host, urls in grouped.items()
+        if urls and SUPPORTED_DOMAINS.get(host) not in active_host_by_family
+    }
 
 
 def _url_for_host(url: str, new_host: str) -> str | None:
@@ -932,6 +983,10 @@ class SeriesResult:
             f"{self.status_extra}{f' · E0: {zero}' if zero else ''}{note}"
         )
 
+    def failure_lines(self) -> list[str]:
+        """Why each failed season failed, one line each; empty when none did."""
+        return [f"S{s.season}: {s.note or 'not at target'}" for s in self.seasons if not s.ok]
+
     def detail_lines(self) -> list[str]:
         lines = []
         for s in self.seasons:
@@ -1083,8 +1138,15 @@ class DomainWorker:
         )
         await asyncio.sleep(wait)
 
-    async def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
-        """One retrying request path shared by GET and POST."""
+    async def _request(self, method: str, url: str, *, resend: bool = True, **kwargs) -> httpx.Response:
+        """One retrying request path shared by GET and POST.
+
+        ``resend=False`` is for a request that must not be sent twice blind:
+        a toggle. A connection error or a 5xx can arrive after the server has
+        already acted, and resending a toggle then undoes it. Only a 429 is
+        still waited out and resent, because the server refused that one
+        before doing anything.
+        """
         if self.client is None:
             raise RuntimeError("DomainWorker client not initialized")
 
@@ -1099,12 +1161,13 @@ class DomainWorker:
                 r = await self.client.request(method, url, **kwargs)
             except httpx.RequestError as exc:
                 last_err = exc
-                if attempt < _MAX_RETRIES:
+                if resend and attempt < _MAX_RETRIES:
                     await self._backoff(attempt, method, url, exc.__class__.__name__)
                     continue
                 break
 
-            if r.status_code in _RETRY_STATUS and attempt < _MAX_RETRIES:
+            retryable = r.status_code in _RETRY_STATUS and (resend or r.status_code == 429)
+            if retryable and attempt < _MAX_RETRIES:
                 await self._backoff(
                     attempt,
                     method,
@@ -1136,6 +1199,25 @@ class DomainWorker:
             raise RuntimeError(f"error page {code} for {url}")
         return doc
 
+    async def _get_account_soup(self, url: str) -> lxml.html.HtmlElement:
+        """Fetch a page whose watch or subscribe state has to be this account's.
+
+        A page without the logged-in chrome is never counted: the session is
+        recovered and the page read again, and a page that still shows no
+        session raises LoggedOutError. The markers checked are the site-wide
+        header ones _LOGIN_MARKERS names, and the monthly site check fails if
+        a season page stops carrying them.
+        """
+        doc = await self._get_soup(url)
+        if self._is_logged_in(doc):
+            return doc
+        logger.warning("%s shows no logged-in session — logging in again before reading it", url)
+        await self._recover_session()
+        doc = await self._get_soup(url)
+        if not self._is_logged_in(doc):
+            raise LoggedOutError(f"{url} shows no logged-in session, so its watch state is not this account's")
+        return doc
+
     async def _post(
         self,
         url: str,
@@ -1145,6 +1227,14 @@ class DomainWorker:
         headers: dict | None = None,
     ) -> httpx.Response:
         return await self._request("POST", url, data=data, json=json, headers=headers or {})
+
+    async def _post_once(self, url: str, data: dict | None = None, *, headers: dict | None = None) -> httpx.Response:
+        """A POST that is never resent on an answer that may follow a change.
+
+        For the subscribe toggles: see _request's ``resend``. Whether the
+        toggle landed is read from the series page afterwards instead.
+        """
+        return await self._request("POST", url, resend=False, data=data, headers=headers or {})
 
     @staticmethod
     def _csrf_headers(token: str, json: bool = True) -> dict[str, str]:
@@ -1274,7 +1364,12 @@ class DomainWorker:
 
         # aniworld + s.to family
         payload: dict[str, str] = {}
-        form = _first(soup, ".//form")
+        # The form with the password field, not merely the first form: a
+        # search box in the page header comes first in the markup, and its
+        # fields were posted in place of the login form's hidden ones.
+        form = _first(soup, ".//form[.//input[@type='password']]")
+        if form is None:
+            form = _first(soup, ".//form")
         if form is not None:
             for inp in form.xpath(".//input[@name]"):
                 name = _attr_str(inp.get("name"))
@@ -1290,6 +1385,11 @@ class DomainWorker:
                 inp = _first(soup, f".//input[@name='{name}'][@value]")
                 if inp is not None:
                     token = _attr_str(inp.get("value")) or ""
+                    # Found outside the form, so it is not in the payload
+                    # yet. This fallback used to find it, log it as found,
+                    # and post without it -- every login then got a 419.
+                    if token:
+                        payload[name] = token
                     break
         if token:
             logger.info("Login CSRF token for %s: %s...", self.host, token[:16])
@@ -1519,7 +1619,14 @@ class DomainWorker:
 
     # ---------- actions ----------
     async def ensure_subscribed(self, url: str, doc) -> bool:
-        """Subscribe to a series if the control is present and not already active."""
+        """Subscribe to a series if the control is present and not already active.
+
+        Both sites' subscribe controls are toggles, so the request goes out
+        once (_post_once) and is never resent blind: a 5xx that arrives after
+        the toggle landed, resent, unsubscribed the series again while this
+        returned True. The answer here is only a first reading; mark_series
+        re-reads the series page afterwards and that decides the result.
+        """
         if self.family not in SUBSCRIBE_FAMILIES:
             return True
 
@@ -1533,7 +1640,7 @@ class DomainWorker:
             if not series_id:
                 logger.warning("No series-id found for subscribe on %s", url)
                 return False
-            r = await self._post(f"{self.base}/ajax/setFavourite", data={"series": series_id})
+            r = await self._post_once(f"{self.base}/ajax/setFavourite", data={"series": series_id})
             if r.status_code != 200:
                 return False
             body = _json_body(r)
@@ -1555,7 +1662,7 @@ class DomainWorker:
             logger.warning("No CSRF token found for subscribe on %s", url)
             return False
 
-        r = await self._post(urljoin(url, sub_url), headers=self._csrf_headers(token, json=False))
+        r = await self._post_once(urljoin(url, sub_url), headers=self._csrf_headers(token, json=False))
         if r.status_code != 200:
             logger.warning("Subscribe failed for %s: %s body=%r", url, r.status_code, r.text[:200])
             return False
@@ -1598,7 +1705,13 @@ class DomainWorker:
 
         elif self.family == "bs":
             verb = "watch:all" if action == ACTION_WATCHED else "unwatch:all"
-            await self._get_soup(f"{self.base}/serie/{slug}/{season}/des/{verb}")
+            answer = await self._get_soup(f"{self.base}/serie/{slug}/{season}/des/{verb}")
+            # bs.to marks by opening a link, so there is no control whose
+            # absence would reveal an expired session -- the link just
+            # answers with a logged-out page. Raising here is what lets
+            # _mark_or_fail log back in, as it does for the other families.
+            if not self._is_logged_in(answer):
+                raise ControlMissingError(f"bs.to answered the mark link for {slug} s{season} with a logged-out page")
 
         else:  # sto
             ctrl = _first(doc, ".//*[@id='season-mark']")
@@ -1628,7 +1741,10 @@ class DomainWorker:
         outcome = SeasonOutcome(season=season)
 
         try:
-            soup = await self._get_soup(season_url)
+            # Read as this account or not at all: a logged-out page shows
+            # every episode unwatched, which an unwatch run took for "already
+            # done" and reported as verified without sending anything.
+            soup = await self._get_account_soup(season_url)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Could not load season %s of %s: %s", season, slug, exc)
             return SeasonOutcome(season=season, ok=False, note=f"load failed: {exc}")
@@ -1662,7 +1778,7 @@ class DomainWorker:
         # Always verify against a freshly fetched page — for a skipped mark and
         # for an issued one alike. An HTTP 200 from these sites does not prove
         # the state actually changed.
-        after_doc = await self._read_back(outcome, season_url, slug, season)
+        after_doc = await self._read_back(outcome, season_url, slug, season, listed)
         if after_doc is None:
             return outcome
         after, target = self._settle_counts(outcome, after_doc, listed, action, slug, season)
@@ -1684,7 +1800,7 @@ class DomainWorker:
             )
             if not await self._mark_or_fail(outcome, after_doc, season_url, slug, season, action):
                 return outcome
-            after_doc = await self._read_back(outcome, season_url, slug, season)
+            after_doc = await self._read_back(outcome, season_url, slug, season, listed)
             if after_doc is None:
                 return outcome
             after, target = self._settle_counts(outcome, after_doc, listed, action, slug, season)
@@ -1725,7 +1841,11 @@ class DomainWorker:
     async def _mark_or_fail(
         self, outcome: SeasonOutcome, doc, season_url: str, slug: str, season: int | str, action: str
     ) -> bool:
-        """Send one season mark, logging back in once if the control is missing.
+        """Send one season mark, logging back in once if the session is gone.
+
+        A gone session shows up two ways: a control missing from the page, or
+        a 401/419 answer to the mark itself. The second used to fail the
+        season outright, and with it every later one in the batch.
 
         Counts the mark in ``outcome.marks``. On failure the outcome is marked
         failed with the reason, and False is returned.
@@ -1736,8 +1856,19 @@ class DomainWorker:
             except ControlMissingError as exc:
                 if not await self._recover_session():
                     raise
-                doc = await self._get_soup(season_url)
+                doc = await self._get_account_soup(season_url)
                 logger.info("Retrying mark for %s season %s after re-login (%s)", slug, season, exc)
+                await self._issue_mark(doc, season_url, slug, season, action)
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code not in _SESSION_LOST_STATUS:
+                    raise
+                # Retried even when the homepage still shows a session: a 419
+                # with a live session means the page's CSRF token went stale,
+                # and the page read again carries a fresh one. The mark is a
+                # set, not a toggle, so sending it once more is safe.
+                await self._recover_session()
+                doc = await self._get_account_soup(season_url)
+                logger.info("Retrying mark for %s season %s after HTTP %s", slug, season, exc.response.status_code)
                 await self._issue_mark(doc, season_url, slug, season, action)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed marking %s season %s: %s", slug, season, exc)
@@ -1747,26 +1878,51 @@ class DomainWorker:
         outcome.marks += 1
         return True
 
-    async def _read_back(self, outcome: SeasonOutcome, season_url: str, slug: str, season: int | str):
-        """Fetch the season page again to see what a mark did; None if it cannot be read."""
+    async def _read_back(self, outcome: SeasonOutcome, season_url: str, slug: str, season: int | str, listed: bool):
+        """Fetch the season page again to see what a mark did; None if it cannot be trusted.
+
+        Fails closed. A read-back that is not this account's page, lists no
+        episodes, or lists fewer than the season had before marking is
+        "unverified", never a pass: each of those counts as 0 watched, which
+        is exactly what an unwatch run is aiming for. A login redirect served
+        with HTTP 200 used to verify every unwatch that way.
+        """
         try:
-            return await self._get_soup(season_url)
+            doc = await self._get_account_soup(season_url)
         except Exception as exc:  # noqa: BLE001
-            outcome.ok = False
-            outcome.note = f"unverified: {exc}"
-            logger.error("Could not verify season %s of %s: %s", season, slug, exc)
-            return None
+            problem = str(exc)
+        else:
+            problem = self._read_back_problem(outcome, doc, listed)
+            if problem is None:
+                return doc
+        outcome.ok = False
+        outcome.note = f"unverified: {problem}"
+        logger.error("Could not verify season %s of %s: %s", season, slug, problem)
+        return None
+
+    def _read_back_problem(self, outcome: SeasonOutcome, doc, listed: bool) -> str | None:
+        """Why a read-back page cannot show the season's state, or None when it can."""
+        _watched, total = self._count_episodes(doc, listed)
+        # A season holding only a listed episode 0 counts 0 episodes and is
+        # still readable, as long as that episode 0 row is there.
+        if total == 0 and self._episode_zero_watched(doc) is None:
+            return "the page read back lists no episodes"
+        if total < outcome.total:
+            return f"the page read back lists {total} episode(s), {outcome.total} before marking"
+        return None
 
     def _settle_counts(
         self, outcome: SeasonOutcome, doc, listed: bool, action: str, slug: str, season: int | str
     ) -> tuple[int, int]:
         """Return (watched, target) as a read-back page shows them.
 
-        A season that gained or lost episodes while it was being marked is
-        judged by the new count.
+        A season that gained episodes while it was being marked is judged by
+        the new count. One that lost some never gets here: _read_back refuses
+        that page, because a shorter list is as likely a partial page as a
+        real change.
         """
         after, after_total = self._count_episodes(doc, listed)
-        if after_total and after_total != outcome.total:
+        if after_total > outcome.total:
             logger.warning(
                 "Episode count for %s season %s changed during marking: %d -> %d",
                 slug,
@@ -1797,7 +1953,10 @@ class DomainWorker:
         slug = slug_for(url, self.family)
         result = SeriesResult(self.host, self.family, url, slug, action=action)
 
-        soup = await self._get_soup(url)
+        # Every page here is read as this account, like the marking pass
+        # reads it: a session that lapses during a long preview would
+        # otherwise file a whole unwatch batch under ALREADY AT TARGET.
+        soup = await self._get_account_soup(url)
         result.title = self._extract_title(soup, self.family)
         if is_utility_page_title(result.title):
             # A retired or mistyped slug is answered with the catalogue page at
@@ -1808,7 +1967,7 @@ class DomainWorker:
         seasons = self.discover_seasons(soup, slug)
 
         for season in seasons:
-            season_soup = await self._get_soup(self.season_url(slug, season))
+            season_soup = await self._get_account_soup(self.season_url(slug, season))
             listed = self.ignores_episode_zero(slug, season)
             before, total = self._count_episodes(season_soup, listed)
             ep0 = self._episode_zero_watched(season_soup)
@@ -1835,11 +1994,14 @@ class DomainWorker:
             result.note = "login failed"
             return result
 
-        if action == ACTION_WATCHED and self.needs_subscribe:
+        subscribing = action == ACTION_WATCHED and self.needs_subscribe
+        if subscribing:
             try:
-                await self.ensure_subscribed(plan.url, await self._get_soup(plan.url))
+                await self.ensure_subscribed(plan.url, await self._get_account_soup(plan.url))
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Subscribe failed for %s: %s", plan.url, exc)
+                # Not the verdict: the toggle may have landed before the error
+                # arrived. The status read below decides.
+                logger.warning("Subscribe request for %s failed: %s", plan.url, exc)
 
         for season in plan.seasons:
             outcome = await self.mark_season(plan.slug, season, action)
@@ -1849,14 +2011,27 @@ class DomainWorker:
 
         # Read subscription state once, after all seasons — it does not change
         # per season, and re-fetching the series page in the loop cost one full
-        # page download per season for nothing.
+        # page download per season for nothing. For a watched run this read is
+        # the subscribe's verification, the same way a season is verified: a
+        # subscribe that did not take used to leave the series at ✓ with only
+        # a Sub:✗ in the cell and a line in the log.
+        subscribe_problem = ""
         if self.needs_subscribe:
             try:
-                result.subscribed, result.watchlist = self._detect_subscription_status(await self._get_soup(plan.url))
-                if action == ACTION_WATCHED and result.subscribed is False:
-                    logger.warning("Subscribe did not take effect for %s", plan.url)
+                page = await self._get_account_soup(plan.url)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Status check failed for %s: %s", plan.url, exc)
+                subscribe_problem = f"subscribe unverified: {exc}"
+            else:
+                result.subscribed, result.watchlist = self._detect_subscription_status(page)
+                if result.subscribed is None:
+                    subscribe_problem = "not subscribed: no subscribe control on the series page"
+                elif not result.subscribed:
+                    subscribe_problem = "not subscribed: the subscribe did not take effect"
+        if subscribing and subscribe_problem:
+            logger.warning("%s for %s", subscribe_problem, plan.url)
+            result.ok = False
+            result.note = subscribe_problem
 
         logger.info(
             "[%s] %s seasons %s action=%s",
@@ -1884,59 +2059,114 @@ async def process_batch(
     plans_by_host: dict[str, list[SeriesPlan]],
     presets: list[SeriesResult],
 ) -> tuple[RunReport, list[SeriesResult]]:
-    """Mark every planned series; ``presets`` are already-verified results."""
-    results: list[SeriesResult] = list(presets)
-    report = RunReport(total_urls=sum(len(p) for p in plans_by_host.values()) + len(presets))
+    """Mark every planned series; ``presets`` are already-verified results.
 
+    Interrupted -- Ctrl+C cancels this task mid-batch -- the run is still
+    written to the failed-URL file before the interruption carries on. It
+    used to vanish: nothing was recorded, so option 6 knew nothing of the
+    series left unmarked, or of the one cut off halfway through.
+    """
     hosts = list(plans_by_host)
     host_w = max((len(h) for h in hosts), default=0)
+    # Filled as each series finishes, so an interruption can tell what was
+    # done, what was in flight and what was never reached.
+    marked_by_host: dict[str, list[SeriesResult]] = {host: [] for host in hosts}
+    in_flight: dict[str, SeriesPlan] = {}
 
-    async def mark_host(host: str, worker: DomainWorker) -> list[SeriesResult]:
+    async def mark_host(host: str, worker: DomainWorker) -> None:
         """Every series for one host, strictly one at a time, in order."""
         plans = plans_by_host[host]
         logger.info("Processing %s (%d URLs)", host, len(plans))
-        marked: list[SeriesResult] = []
+        marked = marked_by_host[host]
         num_w = len(str(len(plans)))
         for idx, plan in enumerate(plans, 1):
             label = plan.title or plan.slug
+            in_flight[host] = plan
             result = await worker.mark_series(plan, action)
+            del in_flight[host]
             marked.append(result)
             # One print per completion, carrying its own host name. The old
             # two-step "label ... " then result printed a line in two halves,
             # which another host finishing in between would split down the
-            # middle now that the hosts run together.
-            print(f"    {host:<{host_w}}  [{idx:>{num_w}}/{len(plans)}] {label} ... {result.line()}")
-        return marked
+            # middle now that the hosts run together -- so a failure's reasons
+            # go out in the same call.
+            lines = [f"    {host:<{host_w}}  [{idx:>{num_w}}/{len(plans)}] {label} ... {result.line()}"]
+            lines += [f"        ✗ {reason}" for reason in result.failure_lines()]
+            print("\n".join(lines))
 
-    async with contextlib.AsyncExitStack() as stack:
-        workers = [await stack.enter_async_context(DomainWorker(host)) for host in hosts]
-        # Same reason as in _preview: the logins are independent servers and
-        # were the whole pause between one host's block and the next.
-        await asyncio.gather(*(worker.login() for worker in workers))
+    try:
+        async with contextlib.AsyncExitStack() as stack:
+            workers = [await stack.enter_async_context(DomainWorker(host)) for host in hosts]
+            # Same reason as in _preview: the logins are independent servers and
+            # were the whole pause between one host's block and the next.
+            await asyncio.gather(*(worker.login() for worker in workers))
 
-        for host in hosts:
-            print(f"\n  → {host}: {len(plans_by_host[host])} series")
-        print()
+            for host in hosts:
+                print(f"\n  → {host}: {len(plans_by_host[host])} series")
+            print()
 
-        # Hosts run together; each one's own series stay sequential. Different
-        # servers, different workers, different sessions -- no site sees more
-        # than one request at a time from this run.
-        per_host = await asyncio.gather(*(mark_host(host, worker) for host, worker in zip(hosts, workers, strict=True)))
+            # Hosts run together; each one's own series stay sequential. Different
+            # servers, different workers, different sessions -- no site sees more
+            # than one request at a time from this run.
+            await asyncio.gather(*(mark_host(host, worker) for host, worker in zip(hosts, workers, strict=True)))
+    except BaseException:
+        cut_off = _unfinished_results(action, plans_by_host, marked_by_host, in_flight)
+        results = [*presets, *(r for host in hosts for r in marked_by_host[host]), *cut_off]
+        _persist_failed_urls(_tally(results), {r.url for r in results}, action)
+        print(f"\n  ✗ interrupted — {len(cut_off)} series not finished, recorded for option 6")
+        raise
 
     # Merged in host order, not completion order, so the report and the
     # failed-URL file do not depend on which host happened to finish first.
-    for marked in per_host:
-        results.extend(marked)
+    results = [*presets, *(r for host in hosts for r in marked_by_host[host])]
+    report = _tally(results)
+    _persist_failed_urls(report, {r.url for r in results}, action)
+    return report, results
 
+
+def _unfinished_results(
+    action: str,
+    plans_by_host: dict[str, list[SeriesPlan]],
+    marked_by_host: dict[str, list[SeriesResult]],
+    in_flight: dict[str, SeriesPlan],
+) -> list[SeriesResult]:
+    """A failed result for every planned series an interruption left unfinished."""
+    unfinished: list[SeriesResult] = []
+    for host, plans in plans_by_host.items():
+        for plan in plans[len(marked_by_host.get(host, [])) :]:
+            note = (
+                "interrupted while being marked — its state is unknown"
+                if in_flight.get(host) is plan
+                else "interrupted before it was marked"
+            )
+            unfinished.append(_failed_result(host, plan.family, plan.url, action, note))
+    return unfinished
+
+
+def _tally(results: list[SeriesResult]) -> RunReport:
+    """Count a run's results into a report; the failed ones are named."""
+    report = RunReport(total_urls=len(results))
     for result in results:
         if result.ok and result.at_target:
             report.successful += 1
         else:
             report.failed += 1
             report.failed_urls.append(result.url)
+    return report
 
-    _persist_failed_urls(report, {r.url for r in results}, action)
-    return report, results
+
+def _failure_identity(url: str) -> tuple[str, str]:
+    """The series a failed-URL entry is about, whatever mirror or season it names.
+
+    Family plus folded slug, the same identity the batch loader collapses
+    duplicates by -- minus the host, which a mirror migration changes. A URL
+    that is not a supported series URL is only ever itself.
+    """
+    classification = classify_url(url)
+    if classification is None:
+        return "", url
+    _host, family, slug = classification
+    return family, slug_key(slug)
 
 
 def _persist_failed_urls(report: RunReport, attempted_urls: set[str], action: str) -> None:
@@ -1959,22 +2189,31 @@ def _persist_failed_urls(report: RunReport, attempted_urls: set[str], action: st
 
     An entry with no action recorded is from an older file and is resolved
     by whichever action attempts it next, exactly as it behaved before.
+
+    Entries are matched by series, not by URL string: a failure recorded on
+    one mirror is retried -- and succeeds -- on another once the batch has
+    been rewritten to it, and matching the string left that entry standing
+    for ever.
     """
     existing = _load_failed_entries()
-    failed_now = {url for url in report.failed_urls if url}
+    attempted = {_failure_identity(url) for url in attempted_urls}
+    # One entry per series, the URL as this run last saw it.
+    failed_now = {_failure_identity(url): url for url in sorted(report.failed_urls) if url}
 
     kept: list[dict] = []
     for entry in existing:
         recorded = entry["action"]
-        if entry["url"] not in attempted_urls:
+        if _failure_identity(entry["url"]) not in attempted:
             kept.append(entry)  # different scope entirely
         elif recorded and recorded != action:
             kept.append(entry)  # the other action's failure still stands
         # else: this run is the authority on it, and re-adds it below if it
         # failed again.
 
-    already = {(e["url"], e["action"]) for e in kept}
-    reconciled = kept + [{"url": url, "action": action} for url in sorted(failed_now) if (url, action) not in already]
+    already = {(_failure_identity(e["url"]), e["action"]) for e in kept}
+    reconciled = kept + [
+        {"url": url, "action": action} for identity, url in failed_now.items() if (identity, action) not in already
+    ]
     reconciled.sort(key=lambda e: (e["url"], e["action"]))
 
     Path(FAILED_URLS_FILE).parent.mkdir(parents=True, exist_ok=True)
@@ -2008,12 +2247,42 @@ def _atomic_write(path: str, content: str) -> None:
         raise
 
 
-def _read_lines(path: str) -> list[str]:
+def _read_text(path: str) -> str | None:
+    """A list file's text, or None when there is no such file.
+
+    utf-8-sig, not utf-8: Notepad's "UTF-8 with BOM" and PowerShell 5.1's
+    ``Set-Content -Encoding UTF8`` both start the file with a BOM. Read as
+    plain utf-8 it stuck to the first line, which then was neither a URL nor
+    a comment -- a KEEP marker there stopped protecting anything, and option
+    5's overwrite deleted the whole keep block with it.
+
+    Anything that is not UTF-8 raises UnreadableListError instead of being
+    guessed at, and so does a path that is not a readable file (a directory
+    typed at option 5). Both used to end the program with a traceback.
+    """
     try:
-        with open(path, encoding="utf-8") as f:
-            return [line.rstrip("\n") for line in f]
+        with open(path, encoding="utf-8-sig") as f:
+            return f.read()
     except FileNotFoundError:
+        return None
+    except UnicodeDecodeError as exc:
+        raise UnreadableListError(
+            f"{path} is not UTF-8 text (byte {exc.start}) — save it as UTF-8; nothing was read from or written to it"
+        ) from exc
+    except OSError as exc:
+        raise UnreadableListError(f"cannot read {path}: {exc.strerror or exc}") from exc
+
+
+def _read_lines(path: str) -> list[str]:
+    text = _read_text(path)
+    if not text:
         return []
+    lines = text.split("\n")
+    # A final newline ends the last line rather than starting an empty one,
+    # exactly as iterating the file did.
+    if lines[-1] == "":
+        lines.pop()
+    return lines
 
 
 def _append_lines(path: str, lines: list[str]) -> None:
@@ -2021,20 +2290,18 @@ def _append_lines(path: str, lines: list[str]) -> None:
 
     Appending to a file whose last line has no newline would splice the new
     URL onto the end of the existing one, silently corrupting both.
+
+    Written as a whole through _atomic_write rather than opened for append:
+    this also writes into the sibling scrapers' series_urls.txt, and an
+    append cut short leaves a half-written URL at the end of someone else's
+    list.
     """
     if not lines:
         return
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    needs_newline = False
-    if os.path.exists(path) and os.path.getsize(path) > 0:
-        with open(path, "rb") as f:
-            f.seek(-1, os.SEEK_END)
-            needs_newline = f.read(1) not in (b"\n", b"\r")
-    with open(path, "a", encoding="utf-8") as f:
-        if needs_newline:
-            f.write("\n")
-        for line in lines:
-            f.write(line + "\n")
+    existing = _read_text(path) or ""
+    if existing and not existing.endswith("\n"):
+        existing += "\n"
+    _atomic_write(path, existing + "".join(line + "\n" for line in lines))
 
 
 # ==================== BATCH FILE SECTIONS ====================
@@ -2152,6 +2419,43 @@ def _batch_section_counts(path: str) -> tuple[int, int]:
     return entries.count(False), entries.count(True)
 
 
+def _temporary_entries(lines: list[str]) -> list[str]:
+    """The temporary entry lines, stripped: what option 7 or an overwrite removes."""
+    permanent = _classify_batch_lines(lines)
+    return [line.strip() for i, line in enumerate(lines) if _is_entry_line(line) and not permanent[i]]
+
+
+# The first line of a retry batch, naming the one action its failures came
+# from. Running the other action on it is refused (see _action_allowed):
+# option 1 on a batch of UNWATCHED failures would mark them all watched.
+_RETRY_HEADER = "# retry batch: failed while marking {label} — run it with option {option} only"
+_RETRY_HEADER_RE = re.compile(r"^\s*#\s*retry batch: failed while marking (watched|unwatched)\b", re.IGNORECASE)
+_ACTION_OPTION = {ACTION_WATCHED: "1", ACTION_UNWATCHED: "2"}
+
+
+def _retry_header(action: str) -> str:
+    return _RETRY_HEADER.format(label=action.upper(), option=_ACTION_OPTION[action])
+
+
+def _batch_action(path: str) -> str | None:
+    """The action a retry batch is bound to, or None for any other batch file."""
+    for line in _read_lines(path):
+        m = _RETRY_HEADER_RE.match(line)
+        if m:
+            return m.group(1).lower()
+    return None
+
+
+def _action_allowed(urls_file: str, action: str) -> bool:
+    """False, and says why, when the batch is a retry batch for the other action."""
+    bound = _batch_action(urls_file)
+    if bound is None or bound == action:
+        return True
+    print(f"\n  ✗ {urls_file} holds failures from marking {bound.upper()}; nothing was marked.")
+    print(f"    use option {_ACTION_OPTION[bound]} for it, or option 5 to switch batch files.")
+    return False
+
+
 def _permanent_by_url(path: str) -> dict[str, bool]:
     """Map each entry line's URL (as load_url_batches stores it) to whether it's permanent.
 
@@ -2253,21 +2557,25 @@ def append_urls_to_scraper_lists(by_family: dict[str, set[str]]) -> None:
 
         if not os.path.exists(export_path):
             prompt = f"\n  export path for {family} does not exist:\n    {export_path}\n  create it?"
-            if not ask_yes_no(prompt, default=False):
+            if not ask_yes_no(prompt):
                 print(f"  skipped {family} export")
                 logger.info("Skipped %s export because path is missing", family)
                 continue
             Path(export_path).parent.mkdir(parents=True, exist_ok=True)
 
-        existing = {line.strip() for line in _read_lines(export_path)}
-        existing.discard("")
-        new_urls = sorted(urls - existing)
-        if not new_urls:
-            logger.info("No new URLs to append for %s", family)
-            print(f"  {family}: nothing new to append")
+        try:
+            existing = {line.strip() for line in _read_lines(export_path)}
+            existing.discard("")
+            new_urls = sorted(urls - existing)
+            if not new_urls:
+                logger.info("No new URLs to append for %s", family)
+                print(f"  {family}: nothing new to append")
+                continue
+            _append_lines(export_path, new_urls)
+        except UnreadableListError as exc:
+            # One unreadable list skips that family only; the others still export.
+            print(f"  ✗ {family}: {exc}")
             continue
-
-        _append_lines(export_path, new_urls)
         logger.info("Appended %d URL(s) to %s scraper list: %s", len(new_urls), family, export_path)
         print(f"  appended {len(new_urls)} new URL(s) → {export_path}")
 
@@ -2315,10 +2623,19 @@ def print_menu(
 ) -> None:
     active_hosts = set((active_host_by_family or {}).values())
     print(f"\n  batch file: {urls_file}")
-    temporary_count, permanent_count = _batch_section_counts(urls_file)
+    try:
+        temporary_count, permanent_count = _batch_section_counts(urls_file)
+        has_urls = _batch_has_urls(urls_file)
+        bound = _batch_action(urls_file)
+    except UnreadableListError as exc:
+        print(f"  ✗ {exc}")
+        temporary_count = permanent_count = 0
+        has_urls, bound = True, None
     if temporary_count or permanent_count:
         print(f"    {temporary_count} temporary, {permanent_count} permanent")
-    if not _batch_has_urls(urls_file):
+    if bound:
+        print(f"    retry batch: failures from marking {bound.upper()} — option {_ACTION_OPTION[bound]} only")
+    if not has_urls:
         print("  default batch file is empty.")
         print("  use option 5 to add a URL or switch batch files.")
 
@@ -2347,26 +2664,21 @@ def print_menu(
     print("    0  exit")
 
 
-def ask_yes_no(prompt: str, default: bool = False, danger: bool = False) -> bool:
-    # Show which answer Enter picks, so the default is never a surprise.
-    suffix = " [Y/n]: " if default else " [y/N]: "
+def ask_yes_no(prompt: str, danger: bool = False) -> bool:
+    """Ask a y/n question through term.confirm: only y or n answers it.
+
+    There is no default any more. Enter used to pick one ("[y/N]"), and
+    "yes"/"no" were taken alongside y and n; now anything but y or n is asked
+    again, and end of input or five unusable answers count as no -- the
+    answer that changes nothing.
+    """
     if danger:
         # Colour the question but not the leading newlines, so the escape
         # codes stay on the line the reader is actually looking at.
         question = prompt.lstrip("\n ")
         lead = prompt[: len(prompt) - len(question)]
-        text = lead + term.danger(question) + term.dim(suffix)
-    else:
-        text = prompt + suffix
-    while True:
-        choice = input(text).strip().lower()
-        if not choice:
-            return default
-        if choice in ("y", "yes"):
-            return True
-        if choice in ("n", "no"):
-            return False
-        print("  please enter y or n.")
+        return term.confirm(lead + term.danger(question) + term.dim(" (y/n): "))
+    return term.confirm(prompt + " (y/n): ")
 
 
 def print_batch_summary(
@@ -2419,6 +2731,18 @@ def _print_run_summary(report: RunReport, results: list[SeriesResult]) -> None:
         col = _term_width() // 3
         rows = [[r.host, r.title or r.slug, r.line()] for r in results]
         _print_table(["Host", "Series", "Result"], rows, [col, col, col])
+
+    failed = [r for r in results if not (r.ok and r.at_target)]
+    if failed:
+        # The table has room for counts, and cuts even those short. Why each
+        # one failed -- a refused mark, a 419, a read-back that could not be
+        # trusted -- used to be in the log file only.
+        print("\n  " + term.step("FAILED"))
+        for r in failed:
+            print(f"    ✗ {r.host}  {r.title or r.slug}{f' — {r.note}' if r.note else ''}")
+            for reason in r.failure_lines():
+                print(f"        {reason}")
+        print()
 
     zero = [(r, s, n) for r in results for s, n in r.episode_zero_notes()]
     if zero:
@@ -2556,6 +2880,11 @@ async def _preview(
                     block += zero_lines
                     if unreadable:
                         block.append("        ⚠ some seasons list no episodes — will be reported as failed")
+                    below = _url_below_series(url, family)
+                    if below:
+                        block.append(
+                            f"        ⚠ the URL names {below}; that part is ignored — the whole series is marked"
+                        )
                     todo_lines.extend(block)
                 else:
                     done.append(result)
@@ -2582,35 +2911,63 @@ async def _preview(
     return todo, done, broken
 
 
-async def run_action(action: str, grouped: dict[str, list[str]], rejected: list[dict]) -> None:
+async def run_action(
+    action: str,
+    grouped: dict[str, list[str]],
+    rejected: list[dict],
+    stranded: dict[str, list[str]] | None = None,
+) -> None:
+    """Preview, confirm and mark one batch.
+
+    ``stranded`` holds the batch's URLs whose family has no reachable mirror.
+    They cannot be attempted, but they are reported and recorded as failed
+    for option 6 -- they used to drop out of the run without a word, so a
+    summary of "all successful" covered a batch it had only partly touched.
+    """
     missing = validate_credentials_for_batch(grouped)
     if missing:
         print("\n  " + term.danger("✗ missing credentials for: " + ", ".join(missing)))
         print("  please fill in watchmaker/.env")
         return
 
-    if not grouped:
+    skipped: list[SeriesResult] = []
+    for host, urls in (stranded or {}).items():
+        family = SUPPORTED_DOMAINS.get(host, "?")
+        note = f"not attempted: no reachable {family} mirror"
+        skipped.extend(_failed_result(host, family, url, action, note) for url in urls)
+    if not grouped and not skipped:
         print("\n  nothing to do — no reachable series in this batch.")
         return
 
-    print_batch_summary(grouped, action=action)
-    ignore_lists = _print_ignore_lists(grouped)
-    print("\n  → preview before marking:")
-    print(f"  action: {action}")
-    print()
-
-    todo, done, broken = await _preview(action, grouped)
+    ignore_lists: list[IgnoreList] = []
+    todo: list[tuple[SeriesResult, SeriesPlan]] = []
+    done: list[SeriesResult] = []
+    broken: list[SeriesResult] = []
+    if grouped:
+        print_batch_summary(grouped, action=action)
+        ignore_lists = _print_ignore_lists(grouped)
+    if skipped:
+        print(f"\n  ⚠ {len(skipped)} series not attempted — no reachable mirror for their site:")
+        for result in skipped:
+            print(f"      {result.url}")
+    if grouped:
+        print("\n  → preview before marking:")
+        print(f"  action: {action}")
+        print()
+        todo, done, broken = await _preview(action, grouped)
+    broken = skipped + broken
 
     if not todo:
+        # Persisted on this path too. A retried series the preview finds at
+        # target is a verified success, and leaving its failure on record kept
+        # it in option 6 for ever.
+        results = broken + done
+        report = _tally(results)
+        report.rejected = rejected
+        report.ignore_lists = ignore_lists
+        _persist_failed_urls(report, {r.url for r in results}, action)
         if broken:
-            print(f"\n  ✗ {len(broken)} series could not be read; nothing was marked.")
-            report, results = RunReport(total_urls=len(broken) + len(done)), broken + done
-            report.failed = len(broken)
-            report.successful = len(done)
-            report.failed_urls = [r.url for r in broken]
-            report.rejected = rejected
-            report.ignore_lists = ignore_lists
-            _persist_failed_urls(report, {r.url for r in results}, action)
+            print(f"\n  ✗ {len(broken)} series could not be read or reached; nothing was marked.")
             _print_run_summary(report, results)
         else:
             print(f"\n  → nothing to do; all {len(done)} series already at target state ({action}).")
@@ -2620,7 +2977,12 @@ async def run_action(action: str, grouped: dict[str, list[str]], rejected: list[
     for il in ignore_lists:
         if il.warning:
             print(f"  ⚠ {il.family} ignore list: {il.problem}")
-    if not ask_yes_no("\n  proceed with marking?", default=False):
+    widened = sum(1 for result, _plan in todo if _url_below_series(result.url, result.family))
+    if widened:
+        # These sites mark whole seasons, and this tool marks every season of a
+        # series; a pasted /staffel-3 or /episode-5 does not narrow that.
+        print(f"  ⚠ {widened} URL(s) name a season or episode; that part is ignored and the whole series is marked")
+    if not ask_yes_no("\n  proceed with marking?"):
         print("  marking cancelled.")
         return
 
@@ -2704,8 +3066,14 @@ async def import_urls(urls_file: str) -> None:
             missing_paths.append((family, import_path))
             continue
 
+        try:
+            lines = _read_lines(import_path)
+        except UnreadableListError as exc:
+            # Skip that family's list, not the whole import.
+            print(f"\n  ✗ {family}: {exc}")
+            continue
         seen: set[str] = set()
-        for raw in _read_lines(import_path):
+        for raw in lines:
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
@@ -2784,7 +3152,7 @@ async def clear_temporary_urls(urls_file: str) -> None:
     """
     lines = _read_lines(urls_file)
     permanent = _classify_batch_lines(lines)
-    doomed = [line.strip() for i, line in enumerate(lines) if _is_entry_line(line) and not permanent[i]]
+    doomed = _temporary_entries(lines)
     kept = [line.strip() for i, line in enumerate(lines) if _is_entry_line(line) and permanent[i]]
 
     print("\n  clear temporary entries")
@@ -2808,7 +3176,7 @@ async def clear_temporary_urls(urls_file: str) -> None:
         print(f"      ... and {len(doomed) - 15} more")
     print(f"\n  {len(kept)} permanent entrie(s) will be kept.")
 
-    if not ask_yes_no("\n  remove them?", default=False, danger=True):
+    if not ask_yes_no("\n  remove them?", danger=True):
         print("  cancelled.")
         return
 
@@ -2819,45 +3187,66 @@ async def clear_temporary_urls(urls_file: str) -> None:
 
 
 async def retry_failed_urls(urls_file: str) -> str:
-    """Load recorded failed URLs into a separate retry batch file.
+    """Load one action's recorded failures into a separate retry batch file.
 
-    The user's main batch file is left untouched; retrying writes the
-    failed URLs to RETRY_BATCH_FILE and switches the active batch to it.
+    The user's main batch file is left untouched; retrying writes the chosen
+    failures to RETRY_BATCH_FILE and switches the active batch to it.
+
+    One action per retry batch. Every failure used to go into one file,
+    whatever action it came from, with the advice to run option 1 and then
+    option 2 on it -- which marked every series watched and then every
+    series unwatched, leaving the ones that had failed under WATCHED
+    unwatched. The file's first line now names its action, and the menu
+    refuses the other action on it (_action_allowed).
     """
-    entries = _load_failed_entries()
-    failed = _load_failed_urls()
-    if not failed:
+    # Grouped by the action they failed under, one line per series.
+    by_action: dict[str, list[str]] = {}
+    seen: set[tuple[str, tuple[str, str]]] = set()
+    for entry in _load_failed_entries():
+        key = (entry["action"], _failure_identity(entry["url"]))
+        if key not in seen:
+            seen.add(key)
+            by_action.setdefault(entry["action"], []).append(entry["url"])
+    if not by_action:
         print("\n  no failed URLs to retry.")
         return urls_file
 
-    # Grouped by the action they failed under, because retrying is only
-    # useful if you know which of options 1 and 2 to run afterwards.
-    by_action: dict[str, list[str]] = {}
-    for entry in entries:
-        by_action.setdefault(entry["action"], []).append(entry["url"])
-
-    print(f"\n  → {len(failed)} failed URL(s) loaded")
-    labels = {
-        ACTION_WATCHED: "failed while marking WATCHED — retry with option 1",
-        ACTION_UNWATCHED: "failed while marking UNWATCHED — retry with option 2",
-        "": "recorded before actions were tracked — use option 1 or 2",
-    }
-    for act in sorted(by_action, key=lambda a: (a == "", a)):
-        print(f"\n    {labels.get(act, act)}:")
+    groups = [
+        ("w", ACTION_WATCHED, "failed while marking WATCHED — retried with option 1"),
+        ("u", ACTION_UNWATCHED, "failed while marking UNWATCHED — retried with option 2"),
+        ("l", "", "recorded before actions were tracked — you choose the action next"),
+    ]
+    offered = [(key, act, label) for key, act, label in groups if by_action.get(act)]
+    print(f"\n  → {sum(len(urls) for urls in by_action.values())} failed URL(s) loaded")
+    for key, act, label in offered:
+        print(f"\n    {key}  {label} ({len(by_action[act])}):")
         for url in by_action[act]:
-            print(f"      {url}")
-    if len(by_action) > 1:
-        print("\n    ⚠ these came from different actions; run each option in turn.")
+            print(f"         {url}")
+    if len(offered) > 1:
+        print("\n    one group per retry: each is run only with its own option.")
+    print("\n    c  cancel")
+    keys = [key for key, _act, _label in offered] + ["c"]
+    choice = term.ask(
+        f"\n  retry which? ({'/'.join(keys)}): ", keys, safe="c", hint="type " + ", ".join(keys[:-1]) + " or c"
+    )
+    if choice == "c":
+        print("  retry cancelled.")
+        return urls_file
 
-    if not ask_yes_no("\n  write failed URLs to the retry batch?"):
+    recorded = next(act for key, act, _label in offered if key == choice)
+    urls = by_action[recorded]
+    # A failure from before actions were recorded has no action to retry
+    # with, so the user names it; nothing is assumed.
+    action = recorded or _ask_one_off_action(f"the {len(urls)} untracked failure(s)")
+    if action is None:
         print("  retry cancelled.")
         return urls_file
 
     Path(RETRY_BATCH_FILE).parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write(RETRY_BATCH_FILE, "".join(url + "\n" for url in failed))
-    print(f"  wrote {len(failed)} failed URL(s) → {RETRY_BATCH_FILE}")
-    print(f"  active batch switched → {RETRY_BATCH_FILE}")
-    logger.info("Wrote %d failed URL(s) to %s", len(failed), RETRY_BATCH_FILE)
+    _atomic_write(RETRY_BATCH_FILE, _retry_header(action) + "\n" + "".join(url + "\n" for url in urls))
+    print(f"  wrote {len(urls)} failed URL(s) → {RETRY_BATCH_FILE}")
+    print(f"  active batch switched → {RETRY_BATCH_FILE} — run it with option {_ACTION_OPTION[action]}")
+    logger.info("Wrote %d failed URL(s) to %s for %s", len(urls), RETRY_BATCH_FILE, action)
     return RETRY_BATCH_FILE
 
 
@@ -2868,8 +3257,10 @@ def _ask_paste_mode(temporary_count: int, permanent_count: int) -> str | None:
     offered even when the working list is empty, which is why this is asked
     then too; overwriting is only offered when there is something to replace.
 
-    Enter cancels rather than picking any: overwriting throws the current
-    list away, so no answer is a safe thing to do on a stray keypress.
+    There is no default: Enter alone is asked again, and only the listed
+    letters answer. c cancels, and is what end of input or five unusable
+    answers give -- overwriting throws the current list away, so a stray
+    keypress must never pick anything.
     """
     kept = f"; the {permanent_count} permanent entrie(s) stay either way" if permanent_count else ""
     if temporary_count:
@@ -2880,34 +3271,23 @@ def _ask_paste_mode(temporary_count: int, permanent_count: int) -> str | None:
         print(f"\n  the batch has no temporary URLs{kept}.")
         print("    a  add this URL to the batch")
     print("    r  run it once now — it is not added to any batch file")
-    keys = "a/o/r" if temporary_count else "a/r"
-    while True:
-        choice = input(f"  [{keys}, Enter cancels]: ").strip().lower()
-        if not choice:
-            return None
-        if choice in ("a", "add"):
-            return "add"
-        if temporary_count and choice in ("o", "overwrite"):
-            return "overwrite"
-        if choice in ("r", "run"):
-            return "once"
-        print(f"  please answer {'a, o or r' if temporary_count else 'a or r'}.")
+    print("    c  cancel")
+    keys = ["a", "o", "r", "c"] if temporary_count else ["a", "r", "c"]
+    choice = term.ask(f"  ({'/'.join(keys)}): ", keys, safe="c", hint="type " + ", ".join(keys[:-1]) + " or c")
+    return {"a": "add", "o": "overwrite", "r": "once"}.get(choice)
 
 
-def _ask_one_off_action() -> str | None:
-    """Ask whether a one-off URL is marked watched or unwatched; None cancels."""
-    print("\n  mark it as:")
+def _ask_one_off_action(what: str = "it") -> str | None:
+    """Ask whether *what* is marked watched or unwatched; None cancels.
+
+    Only w, u or c answer; end of input or five unusable answers cancel.
+    """
+    print(f"\n  mark {what} as:")
     print("    w  watched")
     print("    u  unwatched")
-    while True:
-        choice = input("  [w/u, Enter cancels]: ").strip().lower()
-        if not choice:
-            return None
-        if choice in ("w", "watched"):
-            return ACTION_WATCHED
-        if choice in ("u", "unwatched"):
-            return ACTION_UNWATCHED
-        print("  please answer w or u.")
+    print("    c  cancel")
+    choice = term.ask("  (w/u/c): ", ("w", "u", "c"), safe="c", hint="type w, u or c")
+    return {"w": ACTION_WATCHED, "u": ACTION_UNWATCHED}.get(choice)
 
 
 async def _run_url_once(url: str, classification: tuple[str, str, str]) -> None:
@@ -2955,49 +3335,93 @@ async def _detect_and_add_input(urls_file: str) -> str:
     print("  • Paste URL      → adds it to, or overwrites, the default batch's temporary URLs,")
     print("                     or runs it once without adding it anywhere")
     print("  • Enter path     → switches to that batch file")
-    print("  • Press Enter    → cancel\n")
+    print("  • Type 0         → back to the menu\n")
 
-    user_input = input("  input: ").strip()
-    if not user_input:
-        print("  cancelled.")
-        return urls_file
-
-    if user_input.startswith(("http://", "https://")):
-        classification = classify_url(user_input)
-        if classification is None:
-            print(f"  ✗ not a supported series URL: {user_input}")
+    # No default and no dead end, as in the scrapers' option 5: Enter used to
+    # cancel, and an unsupported URL or a missing file went back to the menu.
+    # Each is asked again now; only 0 goes back -- and so do end of input and
+    # MAX_UNRECOGNIZED unusable answers, which change nothing.
+    for _ in range(term.MAX_UNRECOGNIZED):
+        try:
+            user_input = input("  URL, file path or 0: ").strip()
+        except EOFError:
+            print("  -> No input available; back to the menu.")
             return urls_file
-        temporary_count, permanent_count = _batch_section_counts(DEFAULT_BATCH_FILE)
-        mode = _ask_paste_mode(temporary_count, permanent_count)
-        if mode is None:
+        if user_input == "0":
             print("  cancelled.")
             return urls_file
-        if mode == "once":
-            # The active batch stays what it was; nothing is written to it.
-            await _run_url_once(user_input, classification)
-            return urls_file
-        if mode == "add":
-            existing = _batch_entry_for_series(DEFAULT_BATCH_FILE, classification)
-            if existing:
-                print(f"  already in the batch: {existing}")
-                return DEFAULT_BATCH_FILE
-            _append_batch_urls(DEFAULT_BATCH_FILE, [user_input])
-            print(f"  added 1 URL → {DEFAULT_BATCH_FILE} ({temporary_count + 1} temporary)")
+        if not user_input:
+            print("  ⚠ No answer - paste a URL, enter a file path, or 0 to go back.")
+        elif user_input.startswith(("http://", "https://")):
+            classification = classify_url(user_input)
+            if classification is not None:
+                return await _add_pasted_url(urls_file, user_input, classification)
+            print(f"  ⚠ Not a supported series URL: {user_input} - try again, or 0 to go back.")
         else:
-            # Replaces the working list only. This used to truncate the whole
-            # file, which would take permanent entries with it.
-            _replace_batch_urls(DEFAULT_BATCH_FILE, [user_input])
-            print(f"  replaced {temporary_count} temporary URL(s) with 1 → {DEFAULT_BATCH_FILE}")
+            candidate, problem = _batch_file_candidate(user_input)
+            if candidate:
+                print(f"  loaded batch file → {candidate}")
+                return candidate
+            print(f"  ⚠ {problem} - try again, or 0 to go back.")
+    print(f"  ⚠ No usable answer after {term.MAX_UNRECOGNIZED} tries; back to the menu.")
+    return urls_file
+
+
+def _batch_file_candidate(user_input: str) -> tuple[str | None, str]:
+    """(path, "") for a usable batch file named by *user_input*, else (None, why not).
+
+    Quotes are dropped first: Explorer's "Copy as path" wraps the path in
+    them. Only a readable UTF-8 file is accepted -- a directory used to be
+    switched to and then crashed the program at the next read, and a file in
+    another encoding is refused here rather than half-read later.
+    """
+    name = user_input.strip().strip("\"'")
+    candidate = name if os.path.exists(name) else os.path.join(os.path.dirname(DEFAULT_BATCH_FILE), name)
+    if not os.path.exists(candidate):
+        return None, f"File not found: {name}"
+    if not os.path.isfile(candidate):
+        return None, f"Not a file: {candidate}"
+    try:
+        _read_text(candidate)
+    except UnreadableListError as exc:
+        return None, str(exc)
+    return candidate, ""
+
+
+async def _add_pasted_url(urls_file: str, url: str, classification: tuple[str, str, str]) -> str:
+    """Option 5 with a series URL: add it, overwrite the working list with it, or run it once."""
+    temporary_count, permanent_count = _batch_section_counts(DEFAULT_BATCH_FILE)
+    mode = _ask_paste_mode(temporary_count, permanent_count)
+    if mode is None:
+        print("  cancelled.")
+        return urls_file
+    if mode == "once":
+        # The active batch stays what it was; nothing is written to it.
+        await _run_url_once(url, classification)
+        return urls_file
+    if mode == "add":
+        existing = _batch_entry_for_series(DEFAULT_BATCH_FILE, classification)
+        if existing:
+            print(f"  already in the batch: {existing}")
+            return DEFAULT_BATCH_FILE
+        _append_batch_urls(DEFAULT_BATCH_FILE, [url])
+        print(f"  added 1 URL → {DEFAULT_BATCH_FILE} ({temporary_count + 1} temporary)")
         return DEFAULT_BATCH_FILE
 
-    candidate = user_input
-    if not os.path.exists(candidate):
-        candidate = os.path.join(os.path.dirname(DEFAULT_BATCH_FILE), user_input)
-    if not os.path.exists(candidate):
-        print(f"  ✗ file not found: {user_input}")
+    # Overwriting deletes entries, so it is shown in full and needs a y,
+    # like option 7. A single 'o' used to drop them unseen.
+    doomed = _temporary_entries(_read_lines(DEFAULT_BATCH_FILE))
+    print(f"\n  {len(doomed)} temporary URL(s) will be removed from {DEFAULT_BATCH_FILE}:")
+    for line in doomed:
+        print(f"      {line}")
+    if not ask_yes_no("\n  replace them with this URL?", danger=True):
+        print("  cancelled — the batch file was not changed.")
         return urls_file
-    print(f"  loaded batch file → {candidate}")
-    return candidate
+    # Replaces the working list only. This used to truncate the whole
+    # file, which would take permanent entries with it.
+    _replace_batch_urls(DEFAULT_BATCH_FILE, [url])
+    print(f"  replaced {len(doomed)} temporary URL(s) with 1 → {DEFAULT_BATCH_FILE}")
+    return DEFAULT_BATCH_FILE
 
 
 # ==================== MAIN ====================
@@ -3008,54 +3432,76 @@ async def main() -> None:
     urls_file = DEFAULT_BATCH_FILE
     Path(urls_file).parent.mkdir(parents=True, exist_ok=True)
 
-    batch = load_url_batches(urls_file)
+    batch = _load_batch_or_nothing(urls_file)
     initial_grouped, rejected = batch
     print_banner()
-    print_batch_summary(
-        initial_grouped, header="loaded batch", rejected=rejected, permanent=_permanent_by_url(urls_file)
-    )
+    try:
+        permanent = _permanent_by_url(urls_file)
+    except UnreadableListError:
+        permanent = {}  # already reported by _load_batch_or_nothing
+    print_batch_summary(initial_grouped, header="loaded batch", rejected=rejected, permanent=permanent)
 
     print("\n  → checking hosts ...")
     resolved, host_statuses, active_host_by_family = await resolve_active_hosts(urls_file, preloaded=batch)
+    stranded = _stranded_urls(batch[0], active_host_by_family)
 
     async def refresh() -> None:
-        nonlocal resolved, host_statuses, active_host_by_family, rejected
+        nonlocal resolved, host_statuses, active_host_by_family, rejected, stranded
         print("\n  → refreshing host resolution ...")
-        batch = load_url_batches(urls_file)
+        # An unreadable file leaves an empty batch, never the previous file's
+        # series: option 1 must not mark a list the menu no longer shows.
+        batch = _load_batch_or_nothing(urls_file)
         rejected = batch[1]
         # Reusing this parse across the rewrite resolve_active_hosts may do
         # is safe: _rewrite_batch_urls swaps mapped URLs in place and leaves
         # comments and unsupported lines -- the rejected ones -- untouched.
         resolved, host_statuses, active_host_by_family = await resolve_active_hosts(urls_file, preloaded=batch)
+        stranded = _stranded_urls(batch[0], active_host_by_family)
 
     while True:
         print_banner()
         print_menu(urls_file, host_statuses, bool(_load_failed_urls()), active_host_by_family)
 
-        choice = input("\n  enter number: ").strip()
+        # Only a listed number answers; end of input or five unusable answers
+        # exit, which changes nothing.
+        choice = term.ask(
+            "\n  enter number (0-7): ", [str(n) for n in range(8)], safe="0", hint="type a number from 0 to 7"
+        )
         if choice == "0":
             print("  exiting.")
             break
-        if choice == "1":
-            await run_action(ACTION_WATCHED, resolved, rejected)
-        elif choice == "2":
-            await run_action(ACTION_UNWATCHED, resolved, rejected)
-        elif choice == "3":
-            await export_urls(urls_file)
-        elif choice == "4":
-            await import_urls(urls_file)
-            await refresh()
-        elif choice == "5":
-            urls_file = await _detect_and_add_input(urls_file)
-            await refresh()
-        elif choice == "6":
-            urls_file = await retry_failed_urls(urls_file)
-            await refresh()
-        elif choice == "7":
-            await clear_temporary_urls(urls_file)
-            await refresh()
-        else:
-            print("  invalid option.")
+        try:
+            if choice in ("1", "2"):
+                action = ACTION_WATCHED if choice == "1" else ACTION_UNWATCHED
+                if _action_allowed(urls_file, action):
+                    await run_action(action, resolved, rejected, stranded)
+            elif choice == "3":
+                await export_urls(urls_file)
+            elif choice == "4":
+                await import_urls(urls_file)
+                await refresh()
+            elif choice == "5":
+                urls_file = await _detect_and_add_input(urls_file)
+                await refresh()
+            elif choice == "6":
+                urls_file = await retry_failed_urls(urls_file)
+                await refresh()
+            elif choice == "7":
+                await clear_temporary_urls(urls_file)
+                await refresh()
+        except UnreadableListError as exc:
+            # A list file that cannot be read stops that one action, not the
+            # program; nothing has been written to it.
+            print(f"\n  ✗ {exc}")
+
+
+def _load_batch_or_nothing(urls_file: str) -> tuple[dict[str, list[str]], list[dict]]:
+    """load_url_batches, or an empty batch -- said out loud -- when the file cannot be read."""
+    try:
+        return load_url_batches(urls_file)
+    except UnreadableListError as exc:
+        print(f"\n  ✗ {exc}")
+        return {}, []
 
 
 def _run_cli() -> int:

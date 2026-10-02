@@ -277,21 +277,46 @@ class TestPrintedSummaries:
 
 
 class TestAskYesNo:
-    def test_yes_and_no_are_accepted(self):
-        with _captured(), _answers("y"):
-            assert wm.ask_yes_no("go?") is True
-        with _captured(), _answers("no"):
-            assert wm.ask_yes_no("go?", default=True) is False
+    """Only y or n answers; nothing is assumed (see term.confirm)."""
 
-    def test_enter_takes_the_default_and_the_prompt_says_which(self):
-        with _captured(), _answers("", default="") as asked:
-            assert wm.ask_yes_no("go?", default=True) is True
-        assert "[Y/n]" in asked[0]
+    def test_y_and_n_answer_in_either_case(self):
+        for answer, expected in (("y", True), ("Y", True), ("n", False), ("N", False)):
+            with _captured(), _answers(answer) as asked:
+                assert wm.ask_yes_no("go?") is expected
+            assert len(asked) == 1
+
+    def test_enter_alone_is_asked_again_and_no_default_is_offered(self):
+        # Enter used to take the default the prompt showed as [y/N] / [Y/n].
+        with _captured() as out, _answers("", "y") as asked:
+            assert wm.ask_yes_no("go?") is True
+        assert len(asked) == 2
+        assert "(y/n)" in asked[0]
+        assert "[" not in asked[0], "a bracketed default is back in the prompt"
+        assert "No answer - type y or n." in out.getvalue()
+
+    def test_spelled_out_yes_and_no_are_not_answers(self):
+        with _captured() as out, _answers("yes", "no", "n") as asked:
+            assert wm.ask_yes_no("go?") is False
+        assert len(asked) == 3
+        assert "'yes' is not an option - type y or n." in out.getvalue()
 
     def test_an_unrecognised_answer_is_re_asked(self):
         with _captured(), _answers("maybe", "y") as asked:
             assert wm.ask_yes_no("go?") is True
         assert len(asked) == 2
+
+    def test_end_of_input_answers_no_without_a_traceback(self, monkeypatch):
+        def closed(prompt=""):
+            raise EOFError
+
+        monkeypatch.setattr(builtins, "input", closed)
+        with _captured():
+            assert wm.ask_yes_no("go?", danger=True) is False
+
+    def test_endless_wrong_answers_stop_and_answer_no(self):
+        with _captured(), _answers(default="x") as asked:
+            assert wm.ask_yes_no("go?") is False
+        assert len(asked) == wm.term.MAX_UNRECOGNIZED
 
 
 class TestCredentialValidation:

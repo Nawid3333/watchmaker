@@ -428,8 +428,26 @@ class TestSeriesResult(unittest.TestCase):
 
 
 # ==================== marking + verification ====================
+# The logged-in chrome of all three sites at once: what
+# DomainWorker._is_logged_in looks for. A season page is only counted when it
+# carries it, so every page a live session would be served carries it here.
+SESSION_CHROME = (
+    '<form action="/logout"></form>'
+    '<div class="avatar"><a href="/user/profil/me"></a></div>'
+    '<section class="navigation"><a href="logout">Logout</a></section>'
+)
+
+
+class LoggedOut(str):
+    """A scripted page served the way a lapsed session sees it: no chrome."""
+
+
 class FakeWorker(DomainWorker):
-    """DomainWorker with the network replaced by a scripted page sequence."""
+    """DomainWorker with the network replaced by a scripted page sequence.
+
+    It stands in for a logged-in session, so each page is served with
+    SESSION_CHROME -- unless the script wraps it in LoggedOut.
+    """
 
     def __init__(self, host, pages, mark_effect=None):
         super().__init__(host)
@@ -445,7 +463,7 @@ class FakeWorker(DomainWorker):
         page = self.pages.pop(0)
         if isinstance(page, Exception):
             raise page
-        return soup(page)
+        return soup(page if isinstance(page, LoggedOut) else SESSION_CHROME + page)
 
     async def _issue_mark(self, doc, season_url, slug, season, action):
         self.marks.append((slug, season, action))
@@ -510,7 +528,7 @@ class TestMarkSeason(unittest.IsolatedAsyncioTestCase):
             async def _get_soup(self, url):
                 if not self.pages:
                     raise RuntimeError("error page 502")
-                return soup(self.pages.pop(0))
+                return soup(SESSION_CHROME + self.pages.pop(0))
 
         w = Boom("serienstream.to", [episodes(5, 0)])
         outcome = await w.mark_season("x", 1, ACTION_WATCHED)
@@ -556,6 +574,114 @@ class TestMarkSeason(unittest.IsolatedAsyncioTestCase):
         outcome = await w.mark_season("x", 1, ACTION_WATCHED)
         self.assertFalse(outcome.ok)
         self.assertIn("season-mark", outcome.note)
+
+
+def _status_error(status):
+    request = httpx.Request("POST", "https://serienstream.to/serie/x/staffel-1/mark")
+    return httpx.HTTPStatusError(str(status), request=request, response=httpx.Response(status, request=request))
+
+
+class Relogging(FakeWorker):
+    """A FakeWorker whose re-login is recorded; ``recovers`` is what it reports."""
+
+    def __init__(self, host, pages, recovers=True, mark_errors=()):
+        super().__init__(host, pages)
+        self.recovers = recovers
+        self.recoveries = 0
+        self.mark_errors = list(mark_errors)
+
+    async def _recover_session(self):
+        self.recoveries += 1
+        return self.recovers
+
+    async def _issue_mark(self, doc, season_url, slug, season, action):
+        if self.mark_errors:
+            raise self.mark_errors.pop(0)
+        await super()._issue_mark(doc, season_url, slug, season, action)
+
+
+class TestVerificationFailsClosed(unittest.IsolatedAsyncioTestCase):
+    """A read that cannot show this account's state is never a pass.
+
+    Every way of getting it wrong reads as 0 watched -- exactly what an
+    unwatch run aims for -- so each used to report an unwatch as verified.
+    """
+
+    async def test_a_read_back_without_episode_rows_is_unverified(self):
+        # A login redirect or a maintenance page, served with HTTP 200.
+        w = FakeWorker("serienstream.to", [episodes(12, 12), "<html><head><title>Login</title></head></html>"])
+        outcome = await w.mark_season("x", 1, ACTION_UNWATCHED)
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.note, "unverified: the page read back lists no episodes")
+
+    async def test_a_read_back_listing_fewer_episodes_is_unverified(self):
+        w = FakeWorker("serienstream.to", [episodes(5, 5), episodes(3, 0)])
+        outcome = await w.mark_season("x", 1, ACTION_UNWATCHED)
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.note, "unverified: the page read back lists 3 episode(s), 5 before marking")
+
+    async def test_a_season_that_gained_an_episode_is_still_judged_by_the_new_count(self):
+        w = FakeWorker("serienstream.to", [episodes(5, 0), episodes(6, 6)])
+        outcome = await w.mark_season("x", 1, ACTION_WATCHED)
+        self.assertTrue(outcome.ok)
+        self.assertEqual((outcome.watched_after, outcome.total), (6, 6))
+
+    async def test_a_logged_out_season_page_is_read_again_after_logging_in(self):
+        # The incident: an expired session shows every episode unwatched,
+        # the unwatch was skipped as "already done" and reported as a pass.
+        w = Relogging("serienstream.to", [LoggedOut(episodes(5, 0)), episodes(5, 5), episodes(5, 0)])
+        outcome = await w.mark_season("x", 1, ACTION_UNWATCHED)
+        self.assertTrue(outcome.ok)
+        self.assertEqual(w.recoveries, 1)
+        self.assertEqual(outcome.watched_before, 5, "the count is the logged-in one")
+        self.assertEqual(w.marks, [("x", 1, ACTION_UNWATCHED)])
+
+    async def test_a_session_that_stays_logged_out_fails_the_season_unmarked(self):
+        w = Relogging("serienstream.to", [LoggedOut(episodes(5, 0)), LoggedOut(episodes(5, 0))], recovers=False)
+        outcome = await w.mark_season("x", 1, ACTION_UNWATCHED)
+        self.assertFalse(outcome.ok)
+        self.assertIn("shows no logged-in session", outcome.note)
+        self.assertEqual(w.marks, [])
+
+    async def test_a_logged_out_read_back_is_unverified_unless_the_session_comes_back(self):
+        for recovers, pages, expected_ok in (
+            (True, [episodes(5, 5), LoggedOut(episodes(5, 0)), episodes(5, 0)], True),
+            (False, [episodes(5, 5), LoggedOut(episodes(5, 0)), LoggedOut(episodes(5, 0))], False),
+        ):
+            with self.subTest(recovers=recovers):
+                w = Relogging("serienstream.to", pages, recovers=recovers)
+                outcome = await w.mark_season("x", 1, ACTION_UNWATCHED)
+                self.assertIs(outcome.ok, expected_ok)
+                if not expected_ok:
+                    self.assertTrue(outcome.note.startswith("unverified:"), outcome.note)
+
+    async def test_a_401_or_419_answer_to_a_mark_logs_in_again_and_marks_once_more(self):
+        for status in (401, 419):
+            with self.subTest(status=status):
+                w = Relogging(
+                    "serienstream.to",
+                    [episodes(5, 0), episodes(5, 0), episodes(5, 5)],
+                    mark_errors=[_status_error(status)],
+                )
+                outcome = await w.mark_season("x", 1, ACTION_WATCHED)
+                self.assertTrue(outcome.ok)
+                self.assertEqual(w.recoveries, 1)
+                self.assertEqual(w.marks, [("x", 1, ACTION_WATCHED)])
+
+    async def test_any_other_error_status_is_a_failure_without_a_re_login(self):
+        w = Relogging("serienstream.to", [episodes(5, 0)], mark_errors=[_status_error(500)])
+        outcome = await w.mark_season("x", 1, ACTION_WATCHED)
+        self.assertFalse(outcome.ok)
+        self.assertEqual(w.recoveries, 0)
+
+    async def test_the_preview_never_counts_a_logged_out_page(self):
+        series = (
+            '<div id="season-nav"><a data-season-pill="1" href="/serie/x/staffel-1">1</a></div>'
+            '<h1 class="fw-bold">X</h1>'
+        )
+        w = Relogging("serienstream.to", [series, LoggedOut(episodes(5, 0)), LoggedOut(episodes(5, 0))], recovers=False)
+        with self.assertRaises(main.LoggedOutError):
+            await w.inspect_series("https://serienstream.to/serie/x", ACTION_UNWATCHED)
 
 
 class TestSecondMark(unittest.IsolatedAsyncioTestCase):
@@ -630,6 +756,18 @@ class TestSecondMark(unittest.IsolatedAsyncioTestCase):
 
 
 # ==================== episode 0 placeholders ====================
+def zero_note(outcome, action):
+    """outcome.episode_zero(action), which the calling test expects to exist.
+
+    episode_zero returns None when there is nothing to say; asserting it here
+    fails the test with a reason instead of an AttributeError, and lets the
+    type checker see a note rather than an Optional.
+    """
+    note = outcome.episode_zero(action)
+    assert note is not None, "expected an episode 0 finding"
+    return note
+
+
 def numbered(*rows):
     """A season page from (episode number, watched) pairs, in s.to's markup."""
     cells = "".join(
@@ -673,15 +811,15 @@ class TestEpisodeZero(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(outcome.ok)
         self.assertTrue(outcome.placeholder_only)
         self.assertEqual(w.marks, [("marry-my-husband", 0, ACTION_WATCHED)])
-        self.assertEqual(outcome.episode_zero(ACTION_WATCHED).kind, "placeholder")
-        self.assertFalse(outcome.episode_zero(ACTION_WATCHED).attention)
+        self.assertEqual(zero_note(outcome, ACTION_WATCHED).kind, "placeholder")
+        self.assertFalse(zero_note(outcome, ACTION_WATCHED).attention)
 
     async def test_a_listed_episode_zero_is_marked_even_when_every_counted_episode_is_done(self):
         w = self.worker([numbered((0, False), (1, True)), numbered((0, False), (1, True))], ignored={("x", "1")})
         outcome = await w.mark_season("x", 1, ACTION_WATCHED)
         self.assertTrue(outcome.ok)
         self.assertEqual(w.marks, [("x", 1, ACTION_WATCHED)])
-        self.assertIn("known placeholder", outcome.episode_zero(ACTION_WATCHED).text)
+        self.assertIn("known placeholder", zero_note(outcome, ACTION_WATCHED).text)
 
     async def test_an_ignored_placeholder_does_not_fail_verification(self):
         w = self.worker(
@@ -696,7 +834,7 @@ class TestEpisodeZero(unittest.IsolatedAsyncioTestCase):
         w = self.worker([numbered((0, False), (1, False)), numbered((0, True), (1, True))], ignored={("x", "1")})
         outcome = await w.mark_season("x", 1, ACTION_WATCHED)
         self.assertTrue(outcome.ok)
-        note = outcome.episode_zero(ACTION_WATCHED)
+        note = zero_note(outcome, ACTION_WATCHED)
         self.assertEqual(note.kind, "sticks")
         self.assertTrue(note.attention)
 
@@ -704,7 +842,7 @@ class TestEpisodeZero(unittest.IsolatedAsyncioTestCase):
         w = self.worker([numbered((1, False)), numbered((1, True))], ignored={("x", "1")})
         outcome = await w.mark_season("x", 1, ACTION_WATCHED)
         self.assertTrue(outcome.ok)
-        self.assertEqual(outcome.episode_zero(ACTION_WATCHED).kind, "stale")
+        self.assertEqual(zero_note(outcome, ACTION_WATCHED).kind, "stale")
 
     async def test_a_listed_season_with_no_rows_is_still_a_failure(self):
         w = self.worker(["<html></html>"], ignored={("x", "1")})
@@ -729,7 +867,7 @@ class TestEpisodeZero(unittest.IsolatedAsyncioTestCase):
         outcome = await w.mark_season("x", 1, ACTION_WATCHED)
         self.assertFalse(outcome.ok)
         self.assertIn("episode 0 will not stay watched", outcome.note)
-        note = outcome.episode_zero(ACTION_WATCHED)
+        note = zero_note(outcome, ACTION_WATCHED)
         self.assertEqual(note.kind, "unlisted")
         self.assertTrue(note.attention)
 
@@ -772,7 +910,7 @@ class TestOnlyEpisodeZeroIsOfferedForTheIgnoreList(unittest.IsolatedAsyncioTestC
         outcome, summary = await self._mark([(n, False) for n in range(8)])
         self.assertFalse(outcome.ok)
         self.assertNotIn("episode 0 will not stay watched", outcome.note)
-        note = outcome.episode_zero(ACTION_WATCHED)
+        note = zero_note(outcome, ACTION_WATCHED)
         self.assertEqual(note.kind, "mark failed")
         self.assertFalse(note.attention, "the season's own failure is the thing to look at")
         self.assertNotIn(self.HINT, summary)
@@ -780,14 +918,14 @@ class TestOnlyEpisodeZeroIsOfferedForTheIgnoreList(unittest.IsolatedAsyncioTestC
     async def test_episode_zero_alone_not_sticking_is_offered(self):
         outcome, summary = await self._mark([(n, n != 0) for n in range(8)])
         self.assertIn("episode 0 will not stay watched", outcome.note)
-        self.assertEqual(outcome.episode_zero(ACTION_WATCHED).kind, "unlisted")
+        self.assertEqual(zero_note(outcome, ACTION_WATCHED).kind, "unlisted")
         self.assertIn(self.HINT + ' {"slug": "show", "season": "1"}', summary)
 
     async def test_episode_zero_staying_watched_on_unwatch_is_not_offered(self):
         # A placeholder shows unwatched whatever is done to it, so this is
         # something else and an ignore entry would not explain it.
         outcome, summary = await self._mark([(n, n == 0) for n in range(8)], action=ACTION_UNWATCHED)
-        note = outcome.episode_zero(ACTION_UNWATCHED)
+        note = zero_note(outcome, ACTION_UNWATCHED)
         self.assertEqual(note.kind, "check")
         self.assertTrue(note.attention)
         self.assertNotIn(self.HINT, summary)
@@ -1313,6 +1451,50 @@ class TestLoginRecovery(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(w.posts, main._LOGIN_ATTEMPTS)
 
 
+class TestLoginFormChoice(unittest.IsolatedAsyncioTestCase):
+    """The login payload comes from the form with the password field.
+
+    It came from the first <form> on the page. With a header search box
+    first, the login form's hidden CSRF field was never sent, and the
+    fallback that found the token logged it as found and posted without it.
+    """
+
+    async def _posted(self, login_page):
+        sent = {}
+
+        def reply(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                sent["body"] = request.content.decode()
+                return httpx.Response(200, html="")
+            if request.url.path == "/login":
+                return httpx.Response(200, html=login_page)
+            return httpx.Response(200, html='<html><body><form action="/logout"></form></body></html>')
+
+        w = DomainWorker("serienstream.to")
+        w.creds = {"email": "a@example.test", "password": "pw"}  # never the real .env
+        w.client = httpx.AsyncClient(transport=httpx.MockTransport(reply))
+        self.addAsyncCleanup(w.client.aclose)
+        self.assertTrue(await w._login_form())
+        return sent["body"]
+
+    async def test_a_search_form_first_does_not_replace_the_login_form(self):
+        body = await self._posted(
+            '<html><body><form action="/search"><input name="q" value=""></form>'
+            '<form action="/login" method="post"><input type="hidden" name="_token" value="TOKEN">'
+            '<input name="email"><input type="password" name="password"></form></body></html>'
+        )
+        self.assertIn("_token=TOKEN", body)
+        self.assertNotIn("q=", body)
+
+    async def test_a_token_found_outside_the_form_is_sent(self):
+        body = await self._posted(
+            '<html><body><input type="hidden" name="_token" value="TOKEN">'
+            '<form action="/login" method="post"><input name="email"><input type="password" name="password">'
+            "</form></body></html>"
+        )
+        self.assertIn("_token=TOKEN", body)
+
+
 class TestLoginStateDetection(unittest.TestCase):
     def test_the_bs_homepage_navigation_shows_a_logged_in_session(self):
         worker = LoginRecordingWorker("burningseries.ac", BS_LOGGED_IN_HOME)
@@ -1529,6 +1711,41 @@ class TestPreviewStillTriesEpisodeZero(HostFlowCase):
         self.assertIn("the entry may no longer be needed", out)
 
 
+class TestPreviewSaysASeasonUrlMarksTheWholeSeries(HostFlowCase):
+    """A pasted /staffel-3/episode-5 reads like "mark this episode", but the
+    whole series is marked -- on an unwatch run, every season of it."""
+
+    async def _preview(self, url):
+        def result(worker, url, action, slug):
+            seasons = [SeasonOutcome(1, total=5, watched_before=5, watched_after=0)]
+            return SeriesResult(worker.host, worker.family, url, slug, action=action, seasons=seasons, title="One")
+
+        with mock.patch.object(ScriptedWorker, "_result", result), redirect_stdout(io.StringIO()) as out:
+            todo, _done, _broken = await main._preview(ACTION_UNWATCHED, {"serienstream.to": [url]})
+        self.assertEqual(len(todo), 1)
+        return out.getvalue()
+
+    async def test_a_season_and_episode_url_gets_the_notice(self):
+        out = await self._preview("https://serienstream.to/serie/one/staffel-3/episode-5")
+        self.assertIn("the URL names staffel-3/episode-5; that part is ignored — the whole series is marked", out)
+
+    async def test_a_series_url_does_not(self):
+        out = await self._preview("https://serienstream.to/serie/one/")
+        self.assertNotIn("that part is ignored", out)
+
+    def test_what_a_url_names_below_its_series(self):
+        cases = {
+            ("https://aniworld.to/anime/stream/naruto/staffel-2/episode-1", "aniworld"): "staffel-2/episode-1",
+            ("https://aniworld.to/anime/stream/naruto/filme", "aniworld"): "filme",
+            ("https://burningseries.ac/serie/Foo/1/de", "bs"): "1/de",
+            ("https://serienstream.to/serie/foo?x=1", "sto"): "",
+            ("https://serienstream.to/serie/foo/", "sto"): "",
+        }
+        for (url, family), expected in cases.items():
+            with self.subTest(url=url):
+                self.assertEqual(main._url_below_series(url, family), expected)
+
+
 class TestProcessBatchAcrossHosts(HostFlowCase):
     def setUp(self):
         super().setUp()
@@ -1645,6 +1862,106 @@ class TestProcessBatchAcrossHosts(HostFlowCase):
 
         self.assertEqual(len(ScriptedWorker.made), 2)
         self.assertTrue(all(w.closed for w in ScriptedWorker.made))
+
+
+class TestAnInterruptedRunIsStillRecorded(HostFlowCase):
+    """Ctrl+C cancels process_batch mid-run. Nothing used to be recorded, so
+    option 6 knew nothing of the series left unmarked or cut off halfway."""
+
+    URLS = [f"https://serienstream.to/serie/{name}" for name in ("one", "two", "three")]
+
+    async def test_the_unfinished_series_are_recorded_and_the_finished_ones_keep_their_verdict(self):
+        store = os.path.join(tempfile.mkdtemp(), "failed.json")
+        plans = {
+            "serienstream.to": [
+                main.SeriesPlan(u, "serienstream.to", "sto", u.rsplit("/", 1)[1], [1]) for u in self.URLS
+            ]
+        }
+
+        async def mark_series(worker, plan, action):
+            if plan.slug == "two":
+                raise asyncio.CancelledError  # what Ctrl+C does to the awaiting task
+            return worker._result(plan.url, action, plan.slug)
+
+        with (
+            mock.patch.object(main, "FAILED_URLS_FILE", store),
+            mock.patch.object(ScriptedWorker, "mark_series", mark_series),
+            redirect_stdout(io.StringIO()) as out,
+            self.assertRaises(asyncio.CancelledError),
+        ):
+            await main.process_batch(ACTION_WATCHED, plans, [])
+
+        with mock.patch.object(main, "FAILED_URLS_FILE", store):
+            stored = {(e["url"], e["action"]) for e in main._load_failed_entries()}
+        self.assertEqual(stored, {(self.URLS[1], ACTION_WATCHED), (self.URLS[2], ACTION_WATCHED)})
+        self.assertIn("2 series not finished", out.getvalue())
+
+    def test_the_series_in_flight_is_told_apart_from_the_ones_never_reached(self):
+        plans = {"serienstream.to": [main.SeriesPlan(u, "serienstream.to", "sto", "s", [1]) for u in self.URLS]}
+        done = {"serienstream.to": [SeriesResult("serienstream.to", "sto", self.URLS[0], "s")]}
+        notes = [
+            r.note
+            for r in main._unfinished_results(
+                ACTION_WATCHED, plans, done, {"serienstream.to": plans["serienstream.to"][1]}
+            )
+        ]
+        self.assertEqual(
+            notes, ["interrupted while being marked — its state is unknown", "interrupted before it was marked"]
+        )
+
+
+class TestFailureReasonsAreShown(unittest.TestCase):
+    """The result line has room for counts only; why a season failed was in the log alone."""
+
+    def _failed(self):
+        result = SeriesResult("serienstream.to", "sto", "https://serienstream.to/serie/x", "x", action=ACTION_WATCHED)
+        result.seasons = [
+            SeasonOutcome(1, total=10, watched_before=0, watched_after=10),
+            SeasonOutcome(2, total=10, ok=False, note="mark returned 419"),
+            SeasonOutcome(3, total=10, ok=False, note="unverified: ReadTimeout"),
+        ]
+        result.ok = False
+        return result
+
+    def test_each_failed_season_says_why(self):
+        self.assertEqual(self._failed().failure_lines(), ["S2: mark returned 419", "S3: unverified: ReadTimeout"])
+
+    def test_the_run_summary_lists_them_in_full(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            main._print_run_summary(main.RunReport(total_urls=1, failed=1), [self._failed()])
+        self.assertIn("FAILED", out.getvalue())
+        self.assertIn("S2: mark returned 419", out.getvalue())
+        self.assertIn("S3: unverified: ReadTimeout", out.getvalue())
+
+    def test_a_clean_run_prints_no_failure_block(self):
+        ok = SeriesResult(
+            "h", "sto", "u", "x", action=ACTION_WATCHED, seasons=[SeasonOutcome(1, total=2, watched_after=2)]
+        )
+        out = io.StringIO()
+        with redirect_stdout(out):
+            main._print_run_summary(main.RunReport(total_urls=1, successful=1), [ok])
+        self.assertNotIn("FAILED", out.getvalue())
+
+
+class TestFailureReasonsDuringTheRun(HostFlowCase):
+    async def test_the_progress_line_carries_the_reasons(self):
+        def failing(worker, url, action, slug):
+            seasons = [SeasonOutcome(1, total=5, ok=False, note="mark returned 419")]
+            return SeriesResult(worker.host, worker.family, url, slug, action=action, seasons=seasons, ok=False)
+
+        plans = {
+            "serienstream.to": [
+                main.SeriesPlan("https://serienstream.to/serie/one", "serienstream.to", "sto", "one", [1])
+            ]
+        }
+        with (
+            mock.patch.object(ScriptedWorker, "_result", failing),
+            mock.patch.object(main, "_persist_failed_urls", lambda *a, **kw: None),
+            redirect_stdout(io.StringIO()) as out,
+        ):
+            await main.process_batch(ACTION_WATCHED, plans, [])
+        self.assertIn("✗ S1: mark returned 419", out.getvalue())
 
 
 class TestBatchIsParsedOnce(unittest.IsolatedAsyncioTestCase):
@@ -1839,6 +2156,69 @@ class TestLoadUrlBatchesWithSections(SectionCase):
         self.assertEqual(rejected[0]["reason"], "missing http(s)://")
 
 
+class TestListFilesThatAreNotPlainUtf8(SectionCase):
+    """Notepad's "UTF-8 with BOM" and PowerShell 5.1's Set-Content both start a
+    file with a BOM, and an older file may be in the Windows code page."""
+
+    BOM = "﻿"
+
+    def write_bom(self, *lines):
+        Path(self.path).write_text(self.BOM + "\n".join(lines) + "\n", encoding="utf-8")
+
+    def test_a_bom_does_not_cost_the_first_url(self):
+        self.write_bom("https://serienstream.to/serie/first", "https://serienstream.to/serie/second")
+        grouped, rejected = main.load_url_batches(self.path)
+        self.assertEqual(rejected, [])
+        self.assertEqual(len(grouped["serienstream.to"]), 2)
+
+    def test_a_bom_before_the_keep_marker_keeps_the_block_protected(self):
+        # It used to hide the marker: the keep block read as temporary, and
+        # an option 5 overwrite deleted the marker and every pinned URL.
+        self.write_bom(self.KEEP, "https://serienstream.to/serie/pinned")
+        self.assertEqual(main._batch_section_counts(self.path), (0, 1))
+        main._replace_batch_urls(self.path, ["https://serienstream.to/serie/fresh"])
+        self.assertIn(self.KEEP, self.read())
+        self.assertIn("https://serienstream.to/serie/pinned", self.read())
+
+    def test_a_bom_before_a_dash_tag_keeps_it_permanent(self):
+        self.write_bom("-https://serienstream.to/serie/pinned", "https://serienstream.to/serie/temp")
+        self.assertEqual(main._batch_section_counts(self.path), (1, 1))
+
+    def test_a_file_that_is_not_utf8_is_refused_by_name_not_crashed_on(self):
+        Path(self.path).write_bytes("# Serien für später\nhttps://serienstream.to/serie/x\n".encode("cp1252"))
+        with self.assertRaises(main.UnreadableListError) as caught:
+            main.load_url_batches(self.path)
+        self.assertIn(self.path, str(caught.exception))
+
+    def test_startup_with_an_unreadable_batch_carries_on_with_an_empty_one(self):
+        Path(self.path).write_bytes(b"\xfc\n")
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(main._load_batch_or_nothing(self.path), ({}, []))
+        self.assertIn("is not UTF-8 text", out.getvalue())
+
+    def test_a_directory_is_reported_not_crashed_on(self):
+        with self.assertRaises(main.UnreadableListError):
+            main._read_lines(self.dir.name)
+
+
+class TestAppendIsAtomic(SectionCase):
+    """_append_lines also writes into the sibling scrapers' series_urls.txt."""
+
+    def test_a_write_cut_short_leaves_the_list_as_it_was(self):
+        self.write("https://a")
+        before = Path(self.path).read_bytes()
+        with mock.patch.object(main, "_atomic_write", side_effect=OSError("disk full")), self.assertRaises(OSError):
+            main._append_lines(self.path, ["https://b"])
+        self.assertEqual(Path(self.path).read_bytes(), before)
+
+    def test_the_whole_list_is_written_through_the_atomic_writer(self):
+        Path(self.path).write_text("https://a", encoding="utf-8")  # no final newline
+        with mock.patch.object(main, "_atomic_write", wraps=main._atomic_write) as atomic:
+            main._append_lines(self.path, ["https://b"])
+        atomic.assert_called_once_with(self.path, "https://a\nhttps://b\n")
+        self.assertEqual(self.read(), ["https://a", "https://b"])
+
+
 class TestRewriteBatchUrlsPreservesDashTag(SectionCase):
     """A migrated URL keeps whatever tag it had, so a host failover does not
     silently un-pin a series the user marked permanent."""
@@ -1928,31 +2308,32 @@ class TestBatchRewritersKeepThePermanentSection(SectionCase, unittest.IsolatedAs
     """Retrying now uses a separate retry batch file, so the user's main
     batch file is no longer overwritten."""
 
+    async def _retry(self, entries, *answers):
+        retry_path = os.path.join(self.dir.name, "retry.txt")
+        with (
+            mock.patch.object(main, "_load_failed_entries", return_value=entries),
+            mock.patch.object(main, "RETRY_BATCH_FILE", retry_path),
+            mock.patch("builtins.input", side_effect=list(answers)),
+            redirect_stdout(io.StringIO()),
+        ):
+            return await main.retry_failed_urls(self.path), retry_path
+
     async def test_retry_does_not_modify_the_main_batch_file(self):
         self.write("https://old", self.KEEP, "https://keepme")
         before = self.read()
-        retry_path = os.path.join(self.dir.name, "retry.txt")
-        with (
-            mock.patch.object(main, "_load_failed_urls", return_value=["https://failed-one"]),
-            mock.patch.object(main, "RETRY_BATCH_FILE", retry_path),
-            mock.patch.object(main, "ask_yes_no", return_value=True),
-        ):
-            result = await main.retry_failed_urls(self.path)
+        result, retry_path = await self._retry([{"url": "https://failed-one", "action": ACTION_WATCHED}], "w")
         self.assertEqual(self.read(), before)
         self.assertEqual(result, retry_path)
         self.assertTrue(os.path.exists(result))
-        self.assertEqual(Path(result).read_text(encoding="utf-8").splitlines(), ["https://failed-one"])
+        self.assertEqual(
+            Path(result).read_text(encoding="utf-8").splitlines(),
+            [main._retry_header(ACTION_WATCHED), "https://failed-one"],
+        )
 
     async def test_retry_canceled_leaves_the_main_batch_file_alone(self):
         self.write("https://old", self.KEEP, "https://keepme")
         before = self.read()
-        retry_path = os.path.join(self.dir.name, "retry.txt")
-        with (
-            mock.patch.object(main, "_load_failed_urls", return_value=["https://failed-one"]),
-            mock.patch.object(main, "RETRY_BATCH_FILE", retry_path),
-            mock.patch.object(main, "ask_yes_no", return_value=False),
-        ):
-            result = await main.retry_failed_urls(self.path)
+        result, retry_path = await self._retry([{"url": "https://failed-one", "action": ACTION_WATCHED}], "c")
         self.assertEqual(self.read(), before)
         self.assertEqual(result, self.path)
         self.assertFalse(os.path.exists(retry_path))
@@ -1960,12 +2341,7 @@ class TestBatchRewritersKeepThePermanentSection(SectionCase, unittest.IsolatedAs
     async def test_retry_with_nothing_recorded_does_not_touch_any_file(self):
         self.write("https://old", self.KEEP, "https://keepme")
         before = self.read()
-        retry_path = os.path.join(self.dir.name, "retry.txt")
-        with (
-            mock.patch.object(main, "_load_failed_urls", return_value=[]),
-            mock.patch.object(main, "RETRY_BATCH_FILE", retry_path),
-        ):
-            result = await main.retry_failed_urls(self.path)
+        result, retry_path = await self._retry([])
         self.assertEqual(self.read(), before)
         self.assertEqual(result, self.path)
         self.assertFalse(os.path.exists(retry_path))
@@ -1980,10 +2356,25 @@ class TestBatchRewritersKeepThePermanentSection(SectionCase, unittest.IsolatedAs
     async def test_overwriting_replaces_only_the_working_list(self):
         self.write("https://old", self.KEEP, "https://serienstream.to/serie/keepme")
         pasted = "https://serienstream.to/serie/fresh"
-        await self._paste(pasted, "o")
+        await self._paste(pasted, "o", "y")
 
         self.assertEqual(self.urls(), [pasted, "https://serienstream.to/serie/keepme"])
         self.assertIn(self.KEEP, self.read())
+
+    async def test_overwriting_lists_what_it_drops_and_needs_a_y(self):
+        # A single 'o' used to delete the working list unseen.
+        self.write("https://serienstream.to/serie/old", "https://serienstream.to/serie/older", self.KEEP, "https://k")
+        before = self.read()
+        for refusal in ("n", ""):
+            with self.subTest(refusal=refusal), redirect_stdout(io.StringIO()) as out:
+                # Enter is no answer: asked again, then n.
+                await self._paste("https://serienstream.to/serie/fresh", "o", refusal, "n")
+            self.assertEqual(self.read(), before, "declining must leave the file exactly as it was")
+            shown = out.getvalue()
+            self.assertIn("2 temporary URL(s) will be removed", shown)
+            self.assertIn("https://serienstream.to/serie/old", shown)
+            self.assertIn("https://serienstream.to/serie/older", shown)
+            self.assertNotIn("https://k\n", shown, "a kept URL was listed as doomed")
 
     async def test_adding_keeps_the_working_list_and_goes_above_the_marker(self):
         self.write("https://serienstream.to/serie/old", self.KEEP, "https://serienstream.to/serie/keepme")
@@ -2003,12 +2394,22 @@ class TestBatchRewritersKeepThePermanentSection(SectionCase, unittest.IsolatedAs
         await self._paste("https://serienstream.cx/serie/OLD/staffel-5", "a")
         self.assertEqual(self.read(), before)
 
-    async def test_enter_at_the_add_or_overwrite_question_cancels(self):
+    async def test_enter_at_the_add_or_overwrite_question_is_asked_again_and_c_cancels(self):
         self.write("https://serienstream.to/serie/old", self.KEEP, "https://serienstream.to/serie/keepme")
         before = self.read()
-        result = await self._paste("https://serienstream.to/serie/fresh", "")
+        with redirect_stdout(io.StringIO()) as out:
+            result = await self._paste("https://serienstream.to/serie/fresh", "", "c")
         self.assertEqual(self.read(), before)
         self.assertEqual(result, self.path)
+        self.assertIn("No answer - type a, o, r or c.", out.getvalue())
+
+    async def test_whole_words_are_not_answers_at_the_add_or_overwrite_question(self):
+        self.write("https://serienstream.to/serie/old")
+        before = self.read()
+        with redirect_stdout(io.StringIO()) as out:
+            await self._paste("https://serienstream.to/serie/fresh", "add", "overwrite", "c")
+        self.assertEqual(self.read(), before)
+        self.assertIn("'overwrite' is not an option", out.getvalue())
 
     async def test_an_unclear_answer_is_asked_again(self):
         self.write("https://serienstream.to/serie/old")
@@ -2029,7 +2430,7 @@ class TestBatchRewritersKeepThePermanentSection(SectionCase, unittest.IsolatedAs
         self.write(self.KEEP, "https://serienstream.to/serie/keepme")
         before = self.read()
         with redirect_stdout(io.StringIO()):
-            await self._paste("https://serienstream.to/serie/fresh", "o", "")
+            await self._paste("https://serienstream.to/serie/fresh", "o", "c")
         self.assertEqual(self.read(), before)
 
     # ---- option 5, "run it once" ----
@@ -2062,12 +2463,13 @@ class TestBatchRewritersKeepThePermanentSection(SectionCase, unittest.IsolatedAs
         run.assert_awaited_once_with(ACTION_UNWATCHED, {"serienstream.to": [pasted]}, [])
         self.assertEqual(self.read(), before)
 
-    async def test_enter_at_the_watched_or_unwatched_question_runs_nothing(self):
+    async def test_enter_at_the_watched_or_unwatched_question_is_asked_again_and_runs_nothing(self):
         self.write("https://serienstream.to/serie/old")
         before = self.read()
-        run, _result, _out = await self._run_once("https://serienstream.to/serie/fresh", "r", "")
+        run, _result, out = await self._run_once("https://serienstream.to/serie/fresh", "r", "", "c")
         run.assert_not_awaited()
         self.assertEqual(self.read(), before)
+        self.assertIn("No answer - type w, u or c.", out)
 
     async def test_run_once_with_no_reachable_mirror_marks_nothing(self):
         self.write("https://serienstream.to/serie/old")
@@ -2100,16 +2502,61 @@ class TestBatchRewritersKeepThePermanentSection(SectionCase, unittest.IsolatedAs
             await main._detect_and_add_input(self.path)
         self.assertEqual(Path(self.path).read_text(encoding="utf-8"), before)
 
-    async def test_pressing_enter_cancels_without_touching_the_file(self):
+    async def test_enter_alone_is_asked_again_and_never_touches_the_file(self):
         self.write("https://old", self.KEEP, "https://keepme")
         before = Path(self.path).read_text(encoding="utf-8")
+        feed = mock.Mock(return_value="")
         with (
             mock.patch.object(main, "DEFAULT_BATCH_FILE", self.path),
-            mock.patch("builtins.input", return_value=""),
+            mock.patch("builtins.input", feed),
+            redirect_stdout(io.StringIO()) as out,
         ):
             result = await main._detect_and_add_input(self.path)
         self.assertEqual(result, self.path)
         self.assertEqual(Path(self.path).read_text(encoding="utf-8"), before)
+        self.assertEqual(feed.call_count, main.term.MAX_UNRECOGNIZED)
+        self.assertIn("No answer", out.getvalue())
+
+    async def test_0_goes_back_and_end_of_input_does_too(self):
+        self.write("https://old")
+        before = self.read()
+        for feed in (mock.Mock(return_value="0"), mock.Mock(side_effect=EOFError)):
+            with (
+                self.subTest(feed=feed),
+                mock.patch.object(main, "DEFAULT_BATCH_FILE", self.path),
+                mock.patch("builtins.input", feed),
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(await main._detect_and_add_input(self.path), self.path)
+            self.assertEqual(feed.call_count, 1)
+        self.assertEqual(self.read(), before)
+
+    async def test_a_directory_is_refused_rather_than_switched_to(self):
+        # It used to be accepted, and the next read of it killed the program
+        # with a PermissionError traceback.
+        self.write("https://old")
+        with redirect_stdout(io.StringIO()) as out:
+            result = await self._paste(self.dir.name, "0")
+        self.assertEqual(result, self.path)
+        self.assertIn("Not a file", out.getvalue())
+
+    async def test_a_quoted_path_is_switched_to(self):
+        # Explorer's "Copy as path" wraps the path in double quotes.
+        other = os.path.join(self.dir.name, "other batch.txt")
+        Path(other).write_text("https://serienstream.to/serie/x\n", encoding="utf-8")
+        self.write("https://old")
+        with redirect_stdout(io.StringIO()):
+            result = await self._paste(f'"{other}"')
+        self.assertEqual(result, other)
+
+    async def test_a_file_that_is_not_utf8_is_refused(self):
+        other = os.path.join(self.dir.name, "ansi.txt")
+        Path(other).write_bytes("# Serien für später\nhttps://serienstream.to/serie/x\n".encode("cp1252"))
+        self.write("https://old")
+        with redirect_stdout(io.StringIO()) as out:
+            result = await self._paste(other, "0")
+        self.assertEqual(result, self.path)
+        self.assertIn("is not UTF-8 text", out.getvalue())
 
 
 # ==================== failed URLs are per (url, action) ====================
@@ -2186,6 +2633,66 @@ class TestFailedStore(FailedStoreCase):
         self.record(ACTION_UNWATCHED, {self.X: False})
         self.assertEqual(main._load_failed_urls(), [self.X])
 
+    def test_a_success_on_another_mirror_clears_the_failure(self):
+        # The retry batch is rewritten to the working mirror before it runs,
+        # so the success comes back under a different URL string.
+        self.record(ACTION_WATCHED, {"https://serienstream.cx/serie/x": False})
+        self.record(ACTION_WATCHED, {"https://serienstream.to/serie/x/staffel-2": True})
+        self.assertEqual(self.stored(), set())
+
+    def test_a_failure_that_moved_mirror_is_still_one_entry(self):
+        self.record(ACTION_WATCHED, {"https://serienstream.cx/serie/x": False})
+        self.record(ACTION_WATCHED, {"https://serienstream.to/serie/x": False})
+        self.assertEqual(self.stored(), {("https://serienstream.to/serie/x", ACTION_WATCHED)})
+
+    def test_the_same_slug_on_another_site_is_another_series(self):
+        self.record(ACTION_WATCHED, {"https://burningseries.ac/serie/x": False})
+        self.record(ACTION_WATCHED, {"https://serienstream.to/serie/x": True})
+        self.assertEqual(self.stored(), {("https://burningseries.ac/serie/x", ACTION_WATCHED)})
+
+
+class TestRunActionReconcilesEveryOutcome(FailedStoreCase, unittest.IsolatedAsyncioTestCase):
+    """run_action records what it learned on every path that verified something."""
+
+    def setUp(self):
+        super().setUp()
+        for target, value in (("_print_ignore_lists", lambda grouped: []), ("CREDENTIALS", {"sto": {"email": "e"}})):
+            patcher = mock.patch.object(main, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    async def _run(self, grouped, *, done=(), stranded=None):
+        async def preview(action, grouped):
+            return [], list(done), []
+
+        with mock.patch.object(main, "_preview", preview), redirect_stdout(io.StringIO()) as out:
+            await main.run_action(ACTION_WATCHED, grouped, [], stranded)
+        return out.getvalue()
+
+    async def test_a_retry_the_preview_finds_at_target_clears_the_failure(self):
+        # "nothing to do" returned before anything was recorded, so the
+        # series stayed in option 6 however often it was verified.
+        self.record(ACTION_WATCHED, {self.X: False})
+        at_target = SeriesResult("serienstream.to", "sto", self.X, "x", action=ACTION_WATCHED)
+        at_target.seasons = [SeasonOutcome(1, total=3, watched_before=3, watched_after=3)]
+        out = await self._run({"serienstream.to": [self.X]}, done=[at_target])
+        self.assertIn("nothing to do", out)
+        self.assertEqual(self.stored(), set())
+
+    async def test_series_without_a_reachable_mirror_are_reported_and_recorded(self):
+        # They used to drop out of the run without a word.
+        out = await self._run({}, stranded={"serienstream.to": [self.Y]})
+        self.assertIn("not attempted", out)
+        self.assertIn(self.Y, out)
+        self.assertEqual(self.stored(), {(self.Y, ACTION_WATCHED)})
+
+    def test_a_family_with_no_active_mirror_is_stranded(self):
+        grouped = {"aniworld.to": ["https://aniworld.to/anime/stream/a"], "serienstream.to": [self.X]}
+        self.assertEqual(
+            main._stranded_urls(grouped, {"sto": "serienstream.to"}),
+            {"aniworld.to": ["https://aniworld.to/anime/stream/a"]},
+        )
+
 
 class TestLegacyFailedFile(FailedStoreCase):
     """Files written before the action was recorded hold bare URL strings."""
@@ -2222,7 +2729,9 @@ class TestLegacyFailedFile(FailedStoreCase):
         self.assertEqual(main._load_failed_entries(), [])
 
 
-class TestRetryShowsTheAction(FailedStoreCase, unittest.IsolatedAsyncioTestCase):
+class RetryCase(FailedStoreCase, unittest.IsolatedAsyncioTestCase):
+    """Option 6 against a scratch batch, retry batch and failed-URL file."""
+
     def setUp(self):
         super().setUp()
         self.batch = os.path.join(self.dir.name, "series_urls.txt")
@@ -2232,61 +2741,52 @@ class TestRetryShowsTheAction(FailedStoreCase, unittest.IsolatedAsyncioTestCase)
     def _with_retry_batch(self):
         return mock.patch.object(main, "RETRY_BATCH_FILE", self.retry_batch)
 
-    async def _retry_output(self):
-        printed = []
+    async def _retry(self, *answers):
+        """Run option 6 with *answers* typed; return (active batch, what was printed)."""
         with (
             self._with_retry_batch(),
-            mock.patch.object(main, "ask_yes_no", return_value=False),
-            mock.patch("builtins.print", side_effect=lambda *a, **k: printed.append(" ".join(str(x) for x in a))),
+            mock.patch("builtins.input", side_effect=list(answers)),
+            redirect_stdout(io.StringIO()) as out,
         ):
-            await main.retry_failed_urls(self.batch)
-        return "\n".join(printed)
+            result = await main.retry_failed_urls(self.batch)
+        return result, out.getvalue()
 
+    def retry_lines(self):
+        return Path(self.retry_batch).read_text(encoding="utf-8").splitlines()
+
+
+class TestRetryShowsTheAction(RetryCase):
     async def test_it_names_the_action_and_the_option_to_use(self):
         self.record(ACTION_WATCHED, {self.X: False})
-        with self._with_retry_batch():
-            body = await self._retry_output()
+        _result, body = await self._retry("c")
         self.assertIn("WATCHED", body)
         self.assertIn("option 1", body)
 
     async def test_unwatched_failures_point_at_option_2(self):
         self.record(ACTION_UNWATCHED, {self.X: False})
-        with self._with_retry_batch():
-            body = await self._retry_output()
+        _result, body = await self._retry("c")
         self.assertIn("UNWATCHED", body)
         self.assertIn("option 2", body)
 
     async def test_retry_creates_the_retry_batch_and_returns_it(self):
         self.record(ACTION_WATCHED, {self.X: False})
-        with (
-            self._with_retry_batch(),
-            mock.patch.object(main, "ask_yes_no", return_value=True),
-        ):
-            result = await main.retry_failed_urls(self.batch)
+        result, _body = await self._retry("w")
         self.assertEqual(result, self.retry_batch)
         self.assertEqual(main._load_failed_urls(), [self.X])
-        self.assertEqual(Path(self.retry_batch).read_text(encoding="utf-8").splitlines(), [self.X])
+        self.assertEqual(self.retry_lines(), [main._retry_header(ACTION_WATCHED), self.X])
 
     async def test_retry_does_not_overwrite_the_original_batch_file(self):
         original_body = "# existing\nhttps://original\n"
         Path(self.batch).write_text(original_body, encoding="utf-8")
         self.record(ACTION_WATCHED, {self.X: False})
-        with (
-            self._with_retry_batch(),
-            mock.patch.object(main, "ask_yes_no", return_value=True),
-        ):
-            await main.retry_failed_urls(self.batch)
+        await self._retry("w")
         self.assertEqual(Path(self.batch).read_text(encoding="utf-8"), original_body)
 
     async def test_retry_canceled_leaves_files_alone(self):
         original_body = "# existing\nhttps://original\n"
         Path(self.batch).write_text(original_body, encoding="utf-8")
         self.record(ACTION_WATCHED, {self.X: False})
-        with (
-            self._with_retry_batch(),
-            mock.patch.object(main, "ask_yes_no", return_value=False),
-        ):
-            result = await main.retry_failed_urls(self.batch)
+        result, _body = await self._retry("c")
         self.assertEqual(result, self.batch)
         self.assertEqual(Path(self.batch).read_text(encoding="utf-8"), original_body)
         self.assertFalse(os.path.exists(self.retry_batch))
@@ -2294,16 +2794,70 @@ class TestRetryShowsTheAction(FailedStoreCase, unittest.IsolatedAsyncioTestCase)
     async def test_retry_with_nothing_recorded_does_not_touch_any_file(self):
         original_body = "# existing\nhttps://original\n"
         Path(self.batch).write_text(original_body, encoding="utf-8")
-        with self._with_retry_batch():
-            await main.retry_failed_urls(self.batch)
+        await self._retry()
         self.assertEqual(Path(self.batch).read_text(encoding="utf-8"), original_body)
         self.assertFalse(os.path.exists(self.retry_batch))
 
-    async def test_a_mixed_list_warns_that_both_options_are_needed(self):
+
+class TestRetryRunsEachActionOnItsOwnFailures(RetryCase):
+    """Option 6 used to write every failure into one retry batch, whatever
+    action it came from, and advise running option 1 and then option 2 on it.
+    That marked every series watched and then every series unwatched, so the
+    series that had failed under WATCHED ended up unwatched."""
+
+    async def test_only_the_chosen_actions_failures_are_written(self):
         self.record(ACTION_WATCHED, {self.X: False})
         self.record(ACTION_UNWATCHED, {self.Y: False})
-        body = await self._retry_output()
-        self.assertIn("different actions", body)
+        for answer, action, url in (("w", ACTION_WATCHED, self.X), ("u", ACTION_UNWATCHED, self.Y)):
+            with self.subTest(answer=answer):
+                await self._retry(answer)
+                self.assertEqual(self.retry_lines(), [main._retry_header(action), url])
+                self.assertEqual(main._batch_action(self.retry_batch), action)
+
+    async def test_the_other_action_is_refused_on_a_retry_batch(self):
+        self.record(ACTION_WATCHED, {self.X: False})
+        await self._retry("w")
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertFalse(main._action_allowed(self.retry_batch, ACTION_UNWATCHED))
+        self.assertIn("use option 1", out.getvalue())
+        self.assertTrue(main._action_allowed(self.retry_batch, ACTION_WATCHED))
+        # An ordinary batch file is bound to neither.
+        self.assertTrue(main._action_allowed(self.batch, ACTION_UNWATCHED))
+
+    async def test_the_menu_never_runs_the_other_action_on_a_retry_batch(self):
+        self.record(ACTION_WATCHED, {self.X: False})
+        await self._retry("w")
+        run = mock.AsyncMock()
+        with (
+            mock.patch.object(main, "DEFAULT_BATCH_FILE", self.retry_batch),
+            mock.patch.object(main, "setup_logging"),
+            mock.patch.object(
+                main, "check_hosts", mock.AsyncMock(side_effect=lambda hosts: dict.fromkeys(hosts, "OK"))
+            ),
+            mock.patch.object(main, "run_action", run),
+            mock.patch("builtins.input", side_effect=["2", "1", "0"]),
+            redirect_stdout(io.StringIO()),
+        ):
+            await main.main()
+        self.assertEqual([c.args[0] for c in run.await_args_list], [ACTION_WATCHED], "option 2 must have been refused")
+
+    async def test_untracked_failures_are_retried_with_the_action_the_user_names(self):
+        self.write_raw([self.X])
+        await self._retry("l", "u")
+        self.assertEqual(self.retry_lines(), [main._retry_header(ACTION_UNWATCHED), self.X])
+
+    async def test_naming_no_action_for_untracked_failures_writes_nothing(self):
+        self.write_raw([self.X])
+        result, _body = await self._retry("l", "c")
+        self.assertEqual(result, self.batch)
+        self.assertFalse(os.path.exists(self.retry_batch))
+
+    async def test_the_header_is_neither_a_url_nor_a_keep_marker(self):
+        self.record(ACTION_WATCHED, {self.X: False})
+        await self._retry("w")
+        grouped, rejected = main.load_url_batches(self.retry_batch)
+        self.assertEqual((grouped, rejected), ({"serienstream.to": [self.X]}, []))
+        self.assertEqual(main._batch_section_counts(self.retry_batch), (1, 0))
 
 
 if __name__ == "__main__":
