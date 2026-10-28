@@ -45,7 +45,7 @@ BeautifulSoup, and HTTP/2 lets one connection carry many requests.
    cp .env.example .env
    ```
 
-3. Add series URLs to the default batch file (`series_urls.txt`), one per line. Lines starting with `#` are ignored. Two URLs pointing at the same series (for example `/serie/x` and `/serie/x/staffel-3`) mark the same thing, so only the first is used: a season or episode in a URL is ignored and the whole series is marked, which the preview points out for every such URL. Batch files are read as UTF-8 (a BOM is fine); a file in another encoding is refused with a message rather than guessed at. To keep some entries around permanently instead of clearing them with option 7, see [The batch file has two parts](#the-batch-file-has-two-parts) below.
+3. Add series URLs to the default batch file (`series_urls.txt`), one per line. Lines starting with `#` are ignored. Two URLs pointing at the same series (for example `/serie/x` and `/serie/x/staffel-3`) mark the same thing, so only the first is used: a season or episode in a URL is ignored and the whole series is marked, which the preview points out for every such URL. When the file is loaded (at startup and after options 4–7), such duplicate lines — the same series on another mirror counts too — are listed and deleted after a **y**; the first line stays, unless only a later one is permanent, which then stays instead. **n** leaves the file as it is. Batch files are read as UTF-8 (a BOM is fine); a file in another encoding is refused with a message rather than guessed at. To keep some entries around permanently instead of clearing them with option 7, see [The batch file has two parts](#the-batch-file-has-two-parts) below.
 
 ### Install it as a command
 
@@ -111,7 +111,9 @@ Each host is pinged once; unreachable hosts are skipped, and reachable family mi
 5. Add or run a link / change batch
 6. Retry failed URLs
 7. Clear temporary entries
-8. Exit
+8. Mark only the **temporary** entries as **WATCHED**
+9. Mark only the **permanent** entries as **WATCHED**
+0. Exit
 
 Before marking, a preview of every series, season, and current episode count is shown. For the aniworld and s.to families the preview also shows the current subscription (`Sub`) and watchlist (`WL`) status per series, plus a `⚡` badge when a subscription change is pending. Confirm with **y** to proceed or **n** to cancel.
 
@@ -140,7 +142,8 @@ Everything else — no marker below it, no `-` in front of it — is temporary.
 - **Option 7** clears temporary entries — URLs only. Your own comments and blank lines are left alone, and it shows you exactly what will go before asking.
 - Adding URLs (option 5, or importing with option 4) inserts them **above** the marker, untagged, so new series always land in the working list.
 - Pasting a single URL with option 5 and choosing to overwrite replaces the temporary entries only; the keep block and any `-`-tagged line are left alone. The entries it would remove are listed first, and nothing changes without a `y`.
-- Permanent does **not** mean skipped: both kinds of permanent entries are still marked by options 1 and 2 like any other. Neither one controls anything but what option 7 removes.
+- Permanent does **not** mean skipped: both kinds of permanent entries are still marked by options 1 and 2 like any other.
+- **Options 8 and 9** work like option 1 on one part of the file only: 8 marks just the temporary entries as watched, 9 just the permanent ones. A series listed in both parts counts in both.
 
 The marker is a comment, so a batch file using neither mechanism still works exactly as before — everything in it simply counts as temporary. It's matched loosely (`# KEEP …`, any spacing, casing, or number of `=`), because it is meant to be edited by hand.
 

@@ -565,21 +565,23 @@ def load_url_batches(source: str) -> tuple[dict[str, list[str]], list[dict]]:
     seen_series: set[tuple[str, str]] = set()
     duplicates = 0
 
-    for raw in _read_lines(source):
+    # Each rejected line carries its index, so options 8 and 9 can tell which
+    # part of the file it is in.
+    for index, raw in enumerate(_read_lines(source)):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
         if line.startswith(PERMANENT_PREFIX):
             line = line[len(PERMANENT_PREFIX) :].strip()
         if not line.startswith(("http://", "https://")):
-            rejected.append({"line": line, "reason": "missing http(s)://"})
+            rejected.append({"line": line, "reason": "missing http(s)://", "index": index})
             continue
 
         classification = classify_url(line)
         if classification is None:
             host = _normalize_host(urlparse(line).netloc)
             reason = f"unsupported host: {host}" if host and host not in SUPPORTED_DOMAINS else "could not extract slug"
-            rejected.append({"line": line, "reason": reason})
+            rejected.append({"line": line, "reason": reason, "index": index})
             continue
 
         host, _family, slug = classification
@@ -2331,6 +2333,23 @@ def _is_individually_tagged(line: str) -> bool:
     return line.strip().startswith(PERMANENT_PREFIX)
 
 
+def _entry_url(line: str) -> str:
+    """An entry line's URL as load_url_batches reads it: trimmed, '-' tag removed."""
+    url = line.strip()
+    if url.startswith(PERMANENT_PREFIX):
+        url = url[len(PERMANENT_PREFIX) :].strip()
+    return url
+
+
+def _loads_as_series(url: str) -> bool:
+    """Would load_url_batches put this URL in the batch, rather than reject it?
+
+    Its own two tests, in its order. classify_url alone also accepts
+    "//host/serie/x" and "HTTPS://...", which the loader rejects.
+    """
+    return url.startswith(("http://", "https://")) and classify_url(url) is not None
+
+
 def _classify_batch_lines(lines: list[str]) -> list[bool]:
     """True at index i when lines[i] is permanent: on or below the KEEP
     marker, or individually tagged with a leading '-'.
@@ -2474,6 +2493,79 @@ def _permanent_by_url(path: str) -> dict[str, bool]:
             line = line[len(PERMANENT_PREFIX) :].strip()
         result[line] = is_permanent
     return result
+
+
+def _section_series(path: str, permanent: bool) -> set[tuple[str, str]]:
+    """The series named in one part of the batch file: its permanent or its temporary entries.
+
+    Matched by series (_failure_identity), not by URL text: the loader keeps
+    only the first line of a series and a mirror move rewrites it, so a text
+    match would file a series listed in both parts, or on another mirror,
+    under whichever line happened to survive. A series listed in both parts
+    is in both. A line the loader rejects is only ever itself, which is how
+    the batch's rejected lines are matched.
+    """
+    lines = _read_lines(path)
+    flags = _classify_batch_lines(lines)
+    return {
+        _failure_identity(url) if _loads_as_series(url) else ("", url)
+        for line, is_permanent in zip(lines, flags, strict=True)
+        if is_permanent == permanent and _is_entry_line(line)
+        for url in (_entry_url(line),)
+    }
+
+
+def _duplicate_batch_lines(lines: list[str]) -> list[tuple[int, list[int]]]:
+    """Each series named on more than one line, as (index kept, indexes to delete).
+
+    A series is family plus folded slug (_failure_identity), so one show on
+    two mirrors, or once as /serie/x and once as /serie/x/staffel-3, is one
+    series -- the loader marks it once either way. The first line stays,
+    unless only a later one is permanent: deleting the series' one permanent
+    line would hand it to option 7. Lines the loader rejects are never
+    counted, so the line kept is always one it loads; they are reported as
+    unsupported instead.
+    """
+    permanent = _classify_batch_lines(lines)
+    by_series: dict[tuple[str, str], list[int]] = {}
+    for i, line in enumerate(lines):
+        url = _entry_url(line)
+        if _is_entry_line(line) and _loads_as_series(url):
+            by_series.setdefault(_failure_identity(url), []).append(i)
+    groups = []
+    for indexes in by_series.values():
+        if len(indexes) > 1:
+            keep = next((i for i in indexes if permanent[i]), indexes[0])
+            groups.append((keep, [i for i in indexes if i != keep]))
+    return groups
+
+
+def _offer_duplicate_removal(path: str) -> None:
+    """List the batch file's duplicate lines and delete them on a y.
+
+    Each series is marked once whether or not its extra lines are there, so
+    this only tidies the file. Saying no leaves it exactly as it was.
+    """
+    lines = _read_lines(path)
+    groups = _duplicate_batch_lines(lines)
+    if not groups:
+        return
+    permanent = _classify_batch_lines(lines)
+    doomed = {i for _keep, drop in groups for i in drop}
+    print(f"\n  {len(doomed)} duplicate line(s) in {path} name a series listed on another line:")
+    for keep, drop in sorted(groups):
+        for i, verb in [(keep, "keep  "), *((i, "delete") for i in drop)]:
+            print(f"      {verb}  line {i + 1}: {lines[i].strip()}  ({'permanent' if permanent[i] else 'temporary'})")
+    if not ask_yes_no(f"\n  delete the {len(doomed)} duplicate line(s)?", danger=True):
+        print("  kept — the file was not changed; each series is still marked once.")
+        return
+    try:
+        _atomic_write(path, "".join(line + "\n" for i, line in enumerate(lines) if i not in doomed))
+    except OSError as exc:
+        print(f"  ✗ could not write {path}: {exc.strerror or exc} — the file was not changed.")
+        return
+    print(f"  deleted {len(doomed)} duplicate line(s) → {path}")
+    logger.info("Deleted %d duplicate line(s) from %s", len(doomed), path)
 
 
 def _rewrite_batch_urls(path: str, mapping: dict[str, str]) -> bool:
@@ -2661,6 +2753,8 @@ def print_menu(
     print("    5  add or run a link / change batch")
     print("    6  retry failed URLs")
     print("    7  clear temporary entries")
+    print("    8  mark only TEMPORARY entries as WATCHED")
+    print("    9  mark only PERMANENT entries as WATCHED")
     print("    0  exit")
 
 
@@ -2997,6 +3091,53 @@ async def run_action(
     report.rejected = rejected
     report.ignore_lists = ignore_lists
     _print_run_summary(report, results)
+
+
+async def mark_section_watched(
+    urls_file: str,
+    permanent: bool,
+    grouped: dict[str, list[str]],
+    rejected: list[dict],
+    stranded: dict[str, list[str]],
+) -> None:
+    """Options 8 and 9: option 1 for only the temporary or only the permanent entries.
+
+    The batch as last resolved is narrowed to the series that part of the
+    file names; the preview, confirmation and verification are option 1's
+    own run_action.
+    """
+    part = "permanent" if permanent else "temporary"
+    wanted = _section_series(urls_file, permanent)
+
+    def narrowed(by_host: dict[str, list[str]]) -> dict[str, list[str]]:
+        kept = {host: [url for url in urls if _failure_identity(url) in wanted] for host, urls in by_host.items()}
+        return {host: urls for host, urls in kept.items() if urls}
+
+    picked, picked_stranded = narrowed(grouped), narrowed(stranded)
+    # By line, not by text: the same unsupported text in both parts is two
+    # lines, one in each. A line that has changed since the batch was loaded
+    # is left out rather than guessed at.
+    lines = _read_lines(urls_file)
+    flags = _classify_batch_lines(lines)
+    picked_rejected = [
+        item
+        for item in rejected
+        if 0 <= (i := item.get("index", -1)) < len(lines)
+        and _entry_url(lines[i]) == item["line"]
+        and flags[i] == permanent
+    ]
+    if not picked and not picked_stranded:
+        print(f"\n  nothing to do — the batch has no {part} series.")
+        for item in picked_rejected:
+            print(f"    ⚠ skipped unsupported line: {item['line']}  ({item['reason']})")
+        if permanent:
+            print(f"    entries become permanent below the line {KEEP_MARKER}")
+            print(f"    or with '{PERMANENT_PREFIX}' directly before the URL.")
+        return
+    total = sum(map(len, grouped.values())) + sum(map(len, stranded.values()))
+    count = sum(map(len, picked.values())) + sum(map(len, picked_stranded.values()))
+    print(f"\n  → {part} entries only: {count} of {total} series")
+    await run_action(ACTION_WATCHED, picked, picked_rejected, picked_stranded)
 
 
 def _print_ignore_lists(grouped: dict[str, list[str]]) -> list[IgnoreList]:
@@ -3432,9 +3573,10 @@ async def main() -> None:
     urls_file = DEFAULT_BATCH_FILE
     Path(urls_file).parent.mkdir(parents=True, exist_ok=True)
 
+    # The banner first: loading may ask about duplicate lines.
+    print_banner()
     batch = _load_batch_or_nothing(urls_file)
     initial_grouped, rejected = batch
-    print_banner()
     try:
         permanent = _permanent_by_url(urls_file)
     except UnreadableListError:
@@ -3465,7 +3607,7 @@ async def main() -> None:
         # Only a listed number answers; end of input or five unusable answers
         # exit, which changes nothing.
         choice = term.ask(
-            "\n  enter number (0-7): ", [str(n) for n in range(8)], safe="0", hint="type a number from 0 to 7"
+            "\n  enter number (0-9): ", [str(n) for n in range(10)], safe="0", hint="type a number from 0 to 9"
         )
         if choice == "0":
             print("  exiting.")
@@ -3489,6 +3631,9 @@ async def main() -> None:
             elif choice == "7":
                 await clear_temporary_urls(urls_file)
                 await refresh()
+            elif choice in ("8", "9"):
+                if _action_allowed(urls_file, ACTION_WATCHED):
+                    await mark_section_watched(urls_file, choice == "9", resolved, rejected, stranded)
         except UnreadableListError as exc:
             # A list file that cannot be read stops that one action, not the
             # program; nothing has been written to it.
@@ -3496,8 +3641,13 @@ async def main() -> None:
 
 
 def _load_batch_or_nothing(urls_file: str) -> tuple[dict[str, list[str]], list[dict]]:
-    """load_url_batches, or an empty batch -- said out loud -- when the file cannot be read."""
+    """load_url_batches, or an empty batch -- said out loud -- when the file cannot be read.
+
+    Duplicate lines are offered for deletion first, at startup and on every
+    refresh, so a list edited by hand in between is tidied too.
+    """
     try:
+        _offer_duplicate_removal(urls_file)
         return load_url_batches(urls_file)
     except UnreadableListError as exc:
         print(f"\n  ✗ {exc}")
