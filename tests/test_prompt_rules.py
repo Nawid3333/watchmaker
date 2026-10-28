@@ -169,11 +169,11 @@ class MainMenuTests(unittest.TestCase):
         self.assertIn("exiting.", shown)
 
     def test_endless_typos_at_the_menu_exit_without_doing_anything(self):
-        feed = mock.Mock(return_value="9")
+        feed = mock.Mock(return_value="x")
         run, shown = self._run_menu(feed)
         self.assertEqual(feed.call_count, term.MAX_UNRECOGNIZED)
         run.assert_not_awaited()
-        self.assertIn("'9' is not an option - type a number from 0 to 7.", shown)
+        self.assertIn("'x' is not an option - type a number from 0 to 9.", shown)
 
 
 def _docstring_ids(tree):

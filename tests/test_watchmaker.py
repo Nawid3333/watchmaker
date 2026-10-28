@@ -2304,6 +2304,235 @@ class TestClearTemporaryUrls(SectionCase, unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("https://keepme", body, "a kept URL was listed as doomed")
 
 
+# ==================== options 8 and 9 ====================
+class TestMarkSectionWatched(SectionCase, unittest.IsolatedAsyncioTestCase):
+    """Option 1, narrowed to the temporary (8) or the permanent (9) entries."""
+
+    TEMP = "https://serienstream.to/serie/temp-show"
+    PERM = "https://serienstream.to/serie/perm-show"
+
+    async def _mark(self, permanent, grouped, rejected=(), stranded=None):
+        run = mock.AsyncMock()
+        with mock.patch.object(main, "run_action", run), redirect_stdout(io.StringIO()) as out:
+            await main.mark_section_watched(self.path, permanent, grouped, list(rejected), stranded or {})
+        return run, out.getvalue()
+
+    async def test_option_8_marks_only_the_temporary_series(self):
+        self.write(self.TEMP, self.KEEP, self.PERM)
+        run, _shown = await self._mark(False, {"serienstream.to": [self.TEMP, self.PERM]})
+        run.assert_awaited_once_with(ACTION_WATCHED, {"serienstream.to": [self.TEMP]}, [], {})
+
+    async def test_option_9_marks_both_kinds_of_permanent_entry(self):
+        pinned = "https://serienstream.to/serie/pinned-show"
+        self.write(self.TEMP, "-" + pinned, self.KEEP, self.PERM)
+        run, _shown = await self._mark(True, {"serienstream.to": [self.TEMP, pinned, self.PERM]})
+        run.assert_awaited_once_with(ACTION_WATCHED, {"serienstream.to": [pinned, self.PERM]}, [], {})
+
+    async def test_a_series_is_matched_whatever_mirror_or_season_its_line_names(self):
+        """The resolved batch holds the active mirror's URL; the line may name another."""
+        self.write(self.KEEP, "https://serienstream.cx/serie/Perm-Show/staffel-2")
+        run, _shown = await self._mark(True, {"serienstream.to": [self.PERM]})
+        run.assert_awaited_once_with(ACTION_WATCHED, {"serienstream.to": [self.PERM]}, [], {})
+
+    async def test_a_series_listed_in_both_parts_is_in_both(self):
+        self.write(self.TEMP, self.KEEP, self.TEMP + "/staffel-2")
+        for permanent in (False, True):
+            with self.subTest(permanent=permanent):
+                run, _shown = await self._mark(permanent, {"serienstream.to": [self.TEMP]})
+                run.assert_awaited_once_with(ACTION_WATCHED, {"serienstream.to": [self.TEMP]}, [], {})
+
+    async def test_an_empty_part_marks_nothing_and_says_so(self):
+        self.write(self.TEMP)
+        run, shown = await self._mark(True, {"serienstream.to": [self.TEMP]})
+        run.assert_not_awaited()
+        self.assertIn("the batch has no permanent series", shown)
+
+    async def test_stranded_and_rejected_lines_are_narrowed_too(self):
+        bad = "https://example.com/serie/nope"
+        stranded_temp = "https://aniworld.to/anime/stream/temp-anime"
+        stranded_perm = "https://aniworld.to/anime/stream/perm-anime"
+        self.write(self.TEMP, bad, stranded_temp, self.KEEP, self.PERM, stranded_perm)
+        _grouped, rejected = main.load_url_batches(self.path)
+        run, _shown = await self._mark(
+            False,
+            {"serienstream.to": [self.TEMP, self.PERM]},
+            rejected,
+            {"aniworld.to": [stranded_temp, stranded_perm]},
+        )
+        run.assert_awaited_once_with(
+            ACTION_WATCHED, {"serienstream.to": [self.TEMP]}, rejected, {"aniworld.to": [stranded_temp]}
+        )
+
+    async def test_the_same_unsupported_text_in_both_parts_is_reported_once_per_part(self):
+        self.write(self.TEMP, "not a url", self.KEEP, self.PERM, "not a url")
+        _grouped, rejected = main.load_url_batches(self.path)
+        for permanent, series in ((False, self.TEMP), (True, self.PERM)):
+            with self.subTest(permanent=permanent):
+                run, _shown = await self._mark(permanent, {"serienstream.to": [self.TEMP, self.PERM]}, rejected)
+                self.assertEqual(run.await_args.args[1], {"serienstream.to": [series]})
+                self.assertEqual([item["line"] for item in run.await_args.args[2]], ["not a url"])
+
+    async def test_a_part_with_only_unsupported_lines_still_names_them(self):
+        self.write(self.TEMP, self.KEEP, "not a url")
+        _grouped, rejected = main.load_url_batches(self.path)
+        run, shown = await self._mark(True, {"serienstream.to": [self.TEMP]}, rejected)
+        run.assert_not_awaited()
+        self.assertIn("skipped unsupported line: not a url", shown)
+
+
+class TestSectionOptionsInTheMenu(SectionCase, unittest.IsolatedAsyncioTestCase):
+    TEMP = TestMarkSectionWatched.TEMP
+    PERM = TestMarkSectionWatched.PERM
+
+    async def _menu(self, *answers):
+        run = mock.AsyncMock()
+        with (
+            mock.patch.object(main, "DEFAULT_BATCH_FILE", self.path),
+            mock.patch.object(main, "FAILED_URLS_FILE", os.path.join(self.dir.name, "failed.json")),
+            mock.patch.object(main, "setup_logging"),
+            mock.patch.object(
+                main, "check_hosts", mock.AsyncMock(side_effect=lambda hosts: dict.fromkeys(hosts, "OK"))
+            ),
+            mock.patch.object(main, "run_action", run),
+            mock.patch("builtins.input", side_effect=list(answers)),
+            redirect_stdout(io.StringIO()) as out,
+        ):
+            await main.main()
+        return run, out.getvalue()
+
+    async def test_8_and_9_each_mark_their_own_part_as_watched(self):
+        self.write(self.TEMP, self.KEEP, self.PERM)
+        run, shown = await self._menu("8", "9", "0")
+        self.assertIn("8  mark only TEMPORARY entries as WATCHED", shown)
+        self.assertIn("9  mark only PERMANENT entries as WATCHED", shown)
+        self.assertEqual(
+            [(c.args[0], c.args[1]) for c in run.await_args_list],
+            [
+                (ACTION_WATCHED, {"serienstream.to": [self.TEMP]}),
+                (ACTION_WATCHED, {"serienstream.to": [self.PERM]}),
+            ],
+        )
+
+    async def test_neither_runs_on_a_retry_batch_of_unwatched_failures(self):
+        self.write(main._retry_header(ACTION_UNWATCHED), self.TEMP)
+        run, shown = await self._menu("8", "9", "0")
+        run.assert_not_awaited()
+        self.assertIn("use option 2", shown)
+
+
+# ==================== duplicate lines ====================
+class TestDuplicateBatchLines(SectionCase):
+    A = "https://serienstream.to/serie/show-a"
+    B = "https://serienstream.to/serie/show-b"
+
+    def _offer(self, answer):
+        with mock.patch.object(main, "ask_yes_no", return_value=answer) as ask, redirect_stdout(io.StringIO()) as out:
+            main._offer_duplicate_removal(self.path)
+        return ask, out.getvalue()
+
+    def test_an_exact_copy_is_deleted_on_y(self):
+        self.write(self.A, self.B, self.A)
+        self._offer(True)
+        self.assertEqual(self.read(), [self.A, self.B])
+
+    def test_a_season_link_and_another_mirror_name_the_same_series(self):
+        self.write(self.A, self.A + "/staffel-3", "https://serienstream.cx/serie/Show-A")
+        self._offer(True)
+        self.assertEqual(self.read(), [self.A])
+
+    def test_the_same_slug_on_another_site_is_not_a_duplicate(self):
+        self.write(self.A, "https://burningseries.ac/serie/show-a")
+        ask, _shown = self._offer(True)
+        ask.assert_not_called()
+
+    def test_a_later_permanent_line_stays_instead_of_an_earlier_temporary_one(self):
+        """Keeping the first line would leave the series to option 7."""
+        self.write(self.A, self.KEEP, self.A + "/staffel-2")
+        self._offer(True)
+        self.assertEqual(self.read(), [self.KEEP, self.A + "/staffel-2"])
+
+    def test_a_dash_tag_counts_as_permanent_too(self):
+        self.write(self.A, "-" + self.A)
+        self._offer(True)
+        self.assertEqual(self.read(), ["-" + self.A])
+
+    def test_of_two_permanent_lines_the_first_stays(self):
+        self.write(self.KEEP, self.A, self.A)
+        self._offer(True)
+        self.assertEqual(self.read(), [self.KEEP, self.A])
+
+    def test_saying_no_leaves_the_file_byte_for_byte(self):
+        self.write(self.A, self.A)
+        before = Path(self.path).read_bytes()
+        self._offer(False)
+        self.assertEqual(Path(self.path).read_bytes(), before)
+
+    def test_a_line_the_loader_rejects_is_never_the_one_kept(self):
+        """classify_url accepts these; the loader does not, so keeping one would lose the series."""
+        for rejected in ("//serienstream.to/serie/show-a", "HTTPS://serienstream.to/serie/show-a"):
+            with self.subTest(rejected=rejected):
+                self.write(rejected, self.A)
+                ask, _shown = self._offer(True)
+                ask.assert_not_called()
+                self.assertEqual(self.read(), [rejected, self.A])
+
+    def test_comments_blank_lines_and_unsupported_lines_are_never_touched(self):
+        self.write("# my list", self.A, "", "not a url", "not a url", self.A)
+        self._offer(True)
+        self.assertEqual(self.read(), ["# my list", self.A, "", "not a url", "not a url"])
+
+    def test_every_line_it_deletes_is_listed_first(self):
+        self.write(self.A, self.B, self.A + "/staffel-2")
+        _ask, shown = self._offer(False)
+        self.assertIn(f"keep    line 1: {self.A}  (temporary)", shown)
+        self.assertIn(f"delete  line 3: {self.A}/staffel-2  (temporary)", shown)
+        self.assertNotIn(self.B, shown)
+
+    def test_a_file_without_duplicates_is_never_asked_about(self):
+        self.write(self.A, self.B)
+        ask, shown = self._offer(True)
+        ask.assert_not_called()
+        self.assertEqual(shown, "")
+
+    def test_a_file_that_cannot_be_written_is_reported_not_raised(self):
+        self.write(self.A, self.A)
+        before = Path(self.path).read_bytes()
+        with mock.patch.object(main, "_atomic_write", side_effect=PermissionError(13, "Permission denied")):
+            _ask, shown = self._offer(True)
+        self.assertIn("could not write", shown)
+        self.assertEqual(Path(self.path).read_bytes(), before)
+
+
+class TestDuplicatesAtStartup(SectionCase, unittest.IsolatedAsyncioTestCase):
+    async def _start(self, *answers):
+        with (
+            mock.patch.object(main, "DEFAULT_BATCH_FILE", self.path),
+            mock.patch.object(main, "FAILED_URLS_FILE", os.path.join(self.dir.name, "failed.json")),
+            mock.patch.object(main, "setup_logging"),
+            mock.patch.object(
+                main, "check_hosts", mock.AsyncMock(side_effect=lambda hosts: dict.fromkeys(hosts, "OK"))
+            ),
+            mock.patch("builtins.input", side_effect=list(answers)),
+            redirect_stdout(io.StringIO()) as out,
+        ):
+            await main.main()
+        return out.getvalue()
+
+    async def test_they_are_offered_for_deletion_before_the_menu(self):
+        a = TestDuplicateBatchLines.A
+        self.write(a, a + "/staffel-2")
+        shown = await self._start("y", "0")
+        self.assertEqual(self.read(), [a])
+        self.assertLess(shown.index("name a series listed on another line"), shown.index("options:"))
+
+    async def test_saying_no_keeps_them_and_the_series_is_loaded_once(self):
+        a = TestDuplicateBatchLines.A
+        self.write(a, a + "/staffel-2")
+        shown = await self._start("n", "0")
+        self.assertEqual(self.read(), [a, a + "/staffel-2"])
+        self.assertIn("1 series to process", shown)
+
+
 class TestBatchRewritersKeepThePermanentSection(SectionCase, unittest.IsolatedAsyncioTestCase):
     """Retrying now uses a separate retry batch file, so the user's main
     batch file is no longer overwritten."""
