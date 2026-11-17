@@ -3631,9 +3631,8 @@ async def main() -> None:
             elif choice == "7":
                 await clear_temporary_urls(urls_file)
                 await refresh()
-            elif choice in ("8", "9"):
-                if _action_allowed(urls_file, ACTION_WATCHED):
-                    await mark_section_watched(urls_file, choice == "9", resolved, rejected, stranded)
+            elif choice in ("8", "9") and _action_allowed(urls_file, ACTION_WATCHED):
+                await mark_section_watched(urls_file, choice == "9", resolved, rejected, stranded)
         except UnreadableListError as exc:
             # A list file that cannot be read stops that one action, not the
             # program; nothing has been written to it.
